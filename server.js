@@ -170,6 +170,8 @@ const vehicleAdminRoutes = require("./admin/routes/vehicle");
 const usersAdminRoutes = require("./admin/routes/users");
 const ridesAdminRoutes = require("./admin/routes/rides");
 const dashboardAdminRoutes = require("./admin/routes/dashboard");
+// superadmin
+const settingRoutes = require("./admin/routes/settings");
 
 
 app.use("/api/users", userRoutes);
@@ -186,6 +188,10 @@ app.use("/api/admin/admin-vehicle", vehicleAdminRoutes);
 app.use("/api/admin/admin-users", usersAdminRoutes);
 app.use("/api/admin/admin-rides", ridesAdminRoutes);
 app.use("/api/admin/dashboard", dashboardAdminRoutes);
+
+// super admin
+app.use("/api/admin/settings", settingRoutes);
+
 
 // SSL Certificate
 const privateKey = fs.readFileSync(path.join(__dirname, "ssl/key.pem"));
