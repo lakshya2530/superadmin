@@ -138,7 +138,7 @@ const HTTPS_PORT = process.env.HTTPS_PORT || 3001;
 
 // Enable CORS
 app.use(cors({
-  origin: ["http://localhost:5173","https://one-route-admin.vercel.app", "https://82.25.105.208","https://green-octopus-403216.hostingersite.com"],
+  origin: ["http://localhost:5173","http://localhost:3010", "https://72.61.232.245"],
   credentials: true
 }));
 
