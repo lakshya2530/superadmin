@@ -174,6 +174,8 @@ const dashboardAdminRoutes = require("./admin/routes/dashboard");
 const settingRoutes = require("./admin/routes/settings");
 const auditLogsRouter = require('./admin/routes/auditLogs');
 const notificationsRouter = require('./admin/routes/notifications');
+const reportRouter = require('./admin/routes/reports');
+const supportTicketsRouter = require('./admin/routes/supportTickets');
 
 
 app.use("/api/users", userRoutes);
@@ -195,6 +197,8 @@ app.use("/api/admin/dashboard", dashboardAdminRoutes);
 app.use("/api/admin/settings", settingRoutes);
 app.use("/api/admin/audit-log", auditLogsRouter);
 app.use("/api/admin/notifications", notificationsRouter);
+app.use("/api/admin/report", reportRouter);
+app.use("/api/admin/tickets", supportTicketsRouter);
 
 // SSL Certificate
 const privateKey = fs.readFileSync(path.join(__dirname, "ssl/key.pem"));
