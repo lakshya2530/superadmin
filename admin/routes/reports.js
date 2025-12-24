@@ -549,7 +549,7 @@ router.delete("/:id", async (req, res) => {
 // ==================== SCHEDULED REPORTS API ====================
 
 // Get all scheduled reports
-router.get("/scheduled", async (req, res) => {
+router.get("/scheduled/list", async (req, res) => {
     try {
         const {
             is_active,
@@ -560,8 +560,13 @@ router.get("/scheduled", async (req, res) => {
         } = req.query;
 
         const conn = await pool.getConnection();
+        
+        // Make sure you're querying the correct table
         let query = `SELECT * FROM scheduled_reports WHERE 1=1`;
         const params = [];
+
+        // Add debug logging
+        console.log("Query parameters:", { is_active, report_type, search, page, limit });
 
         if (is_active !== undefined) {
             query += " AND is_active = ?";
@@ -579,10 +584,15 @@ router.get("/scheduled", async (req, res) => {
             params.push(searchTerm, searchTerm);
         }
 
+        console.log("Final query:", query);
+        console.log("Query params:", params);
+
         // Get total count
         const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
         const [countResult] = await conn.query(countQuery, params);
         const total = countResult[0].total;
+
+        console.log("Total records found:", total);
 
         // Apply pagination
         query += " ORDER BY next_run ASC LIMIT ? OFFSET ?";
@@ -590,7 +600,27 @@ router.get("/scheduled", async (req, res) => {
         params.push(parseInt(limit), parseInt(offset));
 
         const [rows] = await conn.query(query, params);
+        
+        console.log("Rows returned:", rows.length);
+        console.log("Sample row:", rows[0]);
+
         conn.release();
+
+        // Helper functions
+        const formatDate = (date) => {
+            if (!date) return null;
+            return new Date(date).toLocaleString();
+        };
+
+        const parseJSON = (jsonString) => {
+            if (!jsonString) return {};
+            try {
+                return JSON.parse(jsonString);
+            } catch (e) {
+                console.error("JSON parse error:", e);
+                return {};
+            }
+        };
 
         const formattedRows = rows.map(row => ({
             ...row,
@@ -621,7 +651,6 @@ router.get("/scheduled", async (req, res) => {
         });
     }
 });
-
 // Create scheduled report
 router.post("/scheduled", async (req, res) => {
     try {
@@ -987,7 +1016,7 @@ router.post("/scheduled/:id/trigger", async (req, res) => {
 // ==================== TEMPLATES API ====================
 
 // Get all report templates
-router.get("/templates", async (req, res) => {
+router.get("/templates/list", async (req, res) => {
     try {
         const { report_type, is_default, search } = req.query;
         const conn = await pool.getConnection();
@@ -1039,7 +1068,7 @@ router.get("/templates", async (req, res) => {
 });
 
 // Create report template
-router.post("/templates", async (req, res) => {
+router.post("/templates/add", async (req, res) => {
     try {
         const {
             template_name,
@@ -1358,7 +1387,7 @@ router.get("/dashboard/overview", async (req, res) => {
 
 // ==================== BULK OPERATIONS ====================
 
-// Bulk delete reports
+// Bulk delete reports - using only 'id' column
 router.delete("/bulk/delete", async (req, res) => {
     try {
         const { report_ids } = req.body;
@@ -1372,10 +1401,10 @@ router.delete("/bulk/delete", async (req, res) => {
 
         const conn = await pool.getConnection();
 
-        // Get existing reports
+        // Get existing reports using 'id' column
         const placeholders = report_ids.map(() => '?').join(',');
         const [existingReports] = await conn.query(
-            `SELECT report_id FROM reports WHERE report_id IN (${placeholders})`,
+            `SELECT id FROM reports WHERE id IN (${placeholders})`,
             report_ids
         );
 
@@ -1387,15 +1416,16 @@ router.delete("/bulk/delete", async (req, res) => {
             });
         }
 
-        const existingIds = existingReports.map(r => r.report_id);
+        const existingIds = existingReports.map(r => r.id);
 
-        // Delete reports
+        // Delete reports using 'id' column
         const [result] = await conn.query(
-            `DELETE FROM reports WHERE report_id IN (${placeholders})`,
+            `DELETE FROM reports WHERE id IN (${placeholders})`,
             existingIds
         );
 
-        // Delete related analytics
+        // Delete related analytics - assuming analytics table has 'id' as foreign key
+        // If analytics table uses a different column name, adjust accordingly
         await conn.query(
             `DELETE FROM report_analytics WHERE report_id IN (${placeholders})`,
             existingIds
@@ -1427,7 +1457,6 @@ router.delete("/bulk/delete", async (req, res) => {
         });
     }
 });
-
 // Update report status
 router.patch("/:id/status", async (req, res) => {
     try {
@@ -1453,7 +1482,7 @@ router.patch("/:id/status", async (req, res) => {
 
         // Check if report exists
         const [checkResult] = await conn.query(
-            'SELECT * FROM reports WHERE report_id = ? OR id = ?',
+            'SELECT * FROM reports WHERE id = ? OR id = ?',
             [reportId, reportId]
         );
 
@@ -1479,8 +1508,8 @@ router.patch("/:id/status", async (req, res) => {
         await conn.query(`
             UPDATE report_generation_history 
             SET status = ?, completed_at = ?
-            WHERE report_id = ?
-        `, [status, updateData.completed_at || null, checkResult[0].report_id]);
+            WHERE id = ?
+        `, [status, updateData.completed_at || null, checkResult[0].id]);
 
         conn.release();
 
@@ -1488,7 +1517,7 @@ router.patch("/:id/status", async (req, res) => {
             success: true,
             message: "Report status updated successfully",
             data: {
-                report_id: checkResult[0].report_id,
+                report_id: checkResult[0].id,
                 new_status: status
             }
         });
