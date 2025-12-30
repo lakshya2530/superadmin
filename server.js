@@ -177,7 +177,9 @@ const notificationsRouter = require('./admin/routes/notifications');
 const reportRouter = require('./admin/routes/reports');
 const supportTicketsRouter = require('./admin/routes/supportTickets');
 const tenantsRouter = require('./admin/routes/tenants');
-
+const authRoutes = require('./admin/routes/auth');
+const invoicesRoutes = require('./admin/routes/invoices');
+const subscriptionPlansRoutes = require('./admin/routes/subscriptionPlans');
 
 
 app.use("/api/users", userRoutes);
@@ -202,6 +204,10 @@ app.use("/api/admin/notifications", notificationsRouter);
 app.use("/api/admin/report", reportRouter);
 app.use("/api/admin/tickets", supportTicketsRouter);
 app.use("/api/admin/monitoring", tenantsRouter);
+app.use("/api/auth", authRoutes.router);
+app.use("/api/admin/invoices", invoicesRoutes);
+app.use("/api/admin/subscriptionPlans", subscriptionPlansRoutes);
+
 // SSL Certificate
 const privateKey = fs.readFileSync(path.join(__dirname, "ssl/key.pem"));
 const certificate = fs.readFileSync(path.join(__dirname, "ssl/cert.pem"));

@@ -56,8 +56,19 @@ router.get("/", async (req, res) => {
         const conn = await pool.getConnection();
         let query = `
             SELECT 
-                n.*
+                n.*,
+                t.id as tenant_id,
+                t.name as name,
+                t.status as tenant_status,
+                t.health_status as tenant_health_status,
+                t.plan as tenant_plan,
+                t.deployment_type as tenant_deployment_type,
+                t.is_self_hosted as tenant_is_self_hosted,
+                t.is_self_managed as tenant_is_self_managed,
+                t.created_at as tenant_created_at,
+                t.updated_at as tenant_updated_at
             FROM notifications n
+            LEFT JOIN tenants t ON n.tenant_id = t.id
             WHERE 1=1
         `;
         const params = [];
@@ -99,18 +110,18 @@ router.get("/", async (req, res) => {
         }
 
         if (search) {
-            query += " AND (n.title LIKE ? OR n.message LIKE ? OR n.metadata LIKE ?)";
+            query += " AND (n.title LIKE ? OR n.message LIKE ? OR t.name LIKE ?)";
             const searchTerm = `%${search}%`;
             params.push(searchTerm, searchTerm, searchTerm);
         }
 
         // Get total count
-        const countQuery = query.replace('SELECT n.*', 'SELECT COUNT(*) as total');
+        const countQuery = query.replace('SELECT n.*, t.id as tenant_id, t.name as name, t.status as tenant_status, t.health_status as tenant_health_status, t.plan as tenant_plan, t.deployment_type as tenant_deployment_type, t.is_self_hosted as tenant_is_self_hosted, t.is_self_managed as tenant_is_self_managed, t.created_at as tenant_created_at, t.updated_at as tenant_updated_at', 'SELECT COUNT(*) as total');
         const [countResult] = await conn.query(countQuery, params);
         const total = countResult[0].total;
 
         // Apply sorting and pagination
-        const validSortColumns = ['id', 'notification_id', 'title', 'type', 'status', 'priority', 'created_at', 'read_at'];
+        const validSortColumns = ['id', 'title', 'type', 'status', 'priority', 'created_at', 'read_at', 'name'];
         const sortColumn = validSortColumns.includes(sort_by) ? sort_by : 'created_at';
         const sortDirection = sort_order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
         
@@ -122,14 +133,44 @@ router.get("/", async (req, res) => {
         conn.release();
 
         // Format timestamps and metadata
-        const formattedRows = rows.map(row => ({
-            ...row,
-            formatted_created_at: formatTimestamp(row.created_at),
-            formatted_read_at: row.read_at ? formatTimestamp(row.read_at) : null,
-            formatted_archived_at: row.archived_at ? formatTimestamp(row.archived_at) : null,
-            metadata: parseMetadata(row.metadata),
-            is_new: row.status === 'unread' || row.status === 'new'
-        }));
+        const formattedRows = rows.map(row => {
+            // Create tenant object with all tenant data
+            const tenant = {
+                id: row.tenant_id,
+                name: row.name,
+                status: row.tenant_status,
+                health_status: row.tenant_health_status,
+                plan: row.tenant_plan,
+                deployment_type: row.tenant_deployment_type,
+                is_self_hosted: row.tenant_is_self_hosted,
+                is_self_managed: row.tenant_is_self_managed,
+                created_at: row.tenant_created_at,
+                updated_at: row.tenant_updated_at,
+                formatted_created_at: row.tenant_created_at ? formatTimestamp(row.tenant_created_at) : null,
+                formatted_updated_at: row.tenant_updated_at ? formatTimestamp(row.tenant_updated_at) : null
+            };
+
+            // Create notification object with tenant nested inside
+            return {
+                id: row.id,
+                title: row.title,
+                message: row.message,
+                type: row.type,
+                status: row.status,
+                priority: row.priority,
+                tenant_id: row.tenant_id,
+                recipient_id: row.recipient_id,
+                read_at: row.read_at,
+                archived_at: row.archived_at,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                formatted_created_at: formatTimestamp(row.created_at),
+                formatted_read_at: row.read_at ? formatTimestamp(row.read_at) : null,
+                formatted_archived_at: row.archived_at ? formatTimestamp(row.archived_at) : null,
+                is_new: row.status === 'unread' || row.status === 'new',
+                tenant: tenant
+            };
+        });
 
         return res.json({
             success: true,
@@ -240,7 +281,6 @@ router.get("/stats", async (req, res) => {
                 recent_notifications: recentNotifications.map(notif => ({
                     ...notif,
                     formatted_created_at: formatTimestamp(notif.created_at),
-                    metadata: parseMetadata(notif.metadata)
                 })),
                 percentage_change: percentageChange,
                 period: period
@@ -264,7 +304,7 @@ router.get("/:id", async (req, res) => {
         const conn = await pool.getConnection();
 
         const [rows] = await conn.query(
-            'SELECT * FROM notifications WHERE notification_id = ? OR id = ?',
+            'SELECT * FROM notifications WHERE id = ?',
             [notificationId, notificationId]
         );
 
@@ -281,7 +321,6 @@ router.get("/:id", async (req, res) => {
         notification.formatted_created_at = formatTimestamp(notification.created_at);
         notification.formatted_read_at = notification.read_at ? formatTimestamp(notification.read_at) : null;
         notification.formatted_archived_at = notification.archived_at ? formatTimestamp(notification.archived_at) : null;
-        notification.metadata = parseMetadata(notification.metadata);
 
         return res.json({
             success: true,
@@ -342,7 +381,7 @@ router.post("/:id/read", async (req, res) => {
         const [result] = await conn.query(`
             UPDATE notifications 
             SET status = 'read', read_at = NOW() 
-            WHERE (notification_id = ? OR id = ?) AND (status = 'unread' OR status = 'new')
+            WHERE (id = ?) AND (status = 'unread' OR status = 'new')
         `, [notificationId, notificationId]);
 
         conn.release();
@@ -414,9 +453,6 @@ router.post("/", async (req, res) => {
             recipient_id,
             tenant_id,
             sender_id,
-            sender_type = 'system',
-            sender_name = 'System',
-            metadata = {}
         } = req.body;
 
         // Validate required fields
@@ -432,7 +468,6 @@ router.post("/", async (req, res) => {
 
         const [result] = await conn.query(`
             INSERT INTO notifications (
-                notification_id,
                 title,
                 message,
                 type,
@@ -441,14 +476,10 @@ router.post("/", async (req, res) => {
                 recipient_id,
                 tenant_id,
                 sender_id,
-                sender_type,
-                sender_name,
-                metadata,
                 status,
                 created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unread', NOW())
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
         `, [
-            notificationId,
             title,
             message || '',
             type,
@@ -457,9 +488,7 @@ router.post("/", async (req, res) => {
             recipient_id || null,
             tenant_id || null,
             sender_id || null,
-            sender_type,
-            sender_name,
-            JSON.stringify(metadata)
+            'unread'
         ]);
 
         conn.release();
@@ -468,8 +497,6 @@ router.post("/", async (req, res) => {
             success: true,
             message: "Notification created successfully",
             data: {
-                id: result.insertId,
-                notification_id: notificationId,
                 title,
                 type,
                 status: 'unread',
@@ -496,9 +523,7 @@ router.put("/:id", async (req, res) => {
             message,
             type,
             status,
-            priority,
-            metadata
-        } = req.body;
+            priority        } = req.body;
 
         const conn = await pool.getConnection();
         
@@ -528,11 +553,7 @@ router.put("/:id", async (req, res) => {
             updateFields.push('priority = ?');
             updateParams.push(priority);
         }
-        if (metadata !== undefined) {
-            updateFields.push('metadata = ?');
-            updateParams.push(JSON.stringify(metadata));
-        }
-
+       
         if (updateFields.length === 0) {
             conn.release();
             return res.status(400).json({
@@ -546,7 +567,7 @@ router.put("/:id", async (req, res) => {
         const query = `
             UPDATE notifications 
             SET ${updateFields.join(', ')}, updated_at = NOW()
-            WHERE notification_id = ? OR id = ?
+            WHERE id = ?
         `;
 
         const [result] = await conn.query(query, updateParams);
@@ -583,7 +604,7 @@ router.post("/:id/archive", async (req, res) => {
         const [result] = await conn.query(`
             UPDATE notifications 
             SET status = 'archived', archived_at = NOW() 
-            WHERE (notification_id = ? OR id = ?) AND status != 'archived'
+            WHERE (id = ?) AND status != 'archived'
         `, [notificationId, notificationId]);
 
         conn.release();
@@ -617,7 +638,7 @@ router.delete("/:id", async (req, res) => {
         const conn = await pool.getConnection();
 
         const [result] = await conn.query(
-            'DELETE FROM notifications WHERE notification_id = ? OR id = ?',
+            'DELETE FROM notifications WHERE id = ?',
             [notificationId, notificationId]
         );
 
@@ -663,19 +684,19 @@ router.post("/bulk-actions", async (req, res) => {
 
         switch (action) {
             case 'mark-read':
-                query = "UPDATE notifications SET status = 'read', read_at = NOW() WHERE notification_id IN (?) AND status IN ('unread', 'new')";
+                query = "UPDATE notifications SET status = 'read', read_at = NOW() WHERE status IN ('unread', 'new')";
                 message = "notifications marked as read";
                 break;
             case 'mark-unread':
-                query = "UPDATE notifications SET status = 'unread', read_at = NULL WHERE notification_id IN (?) AND status = 'read'";
+                query = "UPDATE notifications SET status = 'unread', read_at = NULL WHERE status = 'read'";
                 message = "notifications marked as unread";
                 break;
             case 'archive':
-                query = "UPDATE notifications SET status = 'archived', archived_at = NOW() WHERE notification_id IN (?) AND status != 'archived'";
+                query = "UPDATE notifications SET status = 'archived', archived_at = NOW() WHERE status != 'archived'";
                 message = "notifications archived";
                 break;
             case 'delete':
-                query = "DELETE FROM notifications WHERE notification_id IN (?)";
+                query = "DELETE FROM notifications";
                 message = "notifications deleted";
                 break;
             default:
@@ -744,9 +765,7 @@ router.get("/tenant/:tenant_id", async (req, res) => {
 
         const formattedRows = rows.map(row => ({
             ...row,
-            formatted_created_at: formatTimestamp(row.created_at),
-            metadata: parseMetadata(row.metadata)
-        }));
+            formatted_created_at: formatTimestamp(row.created_at)        }));
 
         return res.json({
             success: true,
@@ -769,6 +788,44 @@ router.get("/tenant/:tenant_id", async (req, res) => {
     }
 });
 
+router.get("/tenants/dropdown", async (req, res) => {
+    try {
+        const conn = await pool.getConnection();
+        
+        const [rows] = await conn.query(`
+            SELECT 
+                id,
+                name,
+                status,
+                health_status
+            FROM tenants 
+            ORDER BY name ASC
+        `);
+        
+        conn.release();
+
+        const tenantsList = rows.map(row => ({
+            value: row.id,
+            label: row.name,
+            status: row.status,
+            health_status: row.health_status
+        }));
+
+        return res.json({
+            success: true,
+            data: tenantsList
+        });
+
+    } catch (err) {
+        console.error("Tenants dropdown fetch error:", err);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch tenants for dropdown",
+            error: err.message
+        });
+    }
+});
+
 // Send notification to multiple tenants (like in your screenshot)
 router.post("/send", async (req, res) => {
     try {
@@ -778,9 +835,7 @@ router.post("/send", async (req, res) => {
             title,
             message,
             sender_id,
-            sender_name = 'System',
-            metadata = {}
-        } = req.body;
+                } = req.body;
 
         // Validate required fields
         if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
@@ -806,7 +861,6 @@ router.post("/send", async (req, res) => {
             
             const [result] = await conn.query(`
                 INSERT INTO notifications (
-                    notification_id,
                     title,
                     message,
                     type,
@@ -814,8 +868,6 @@ router.post("/send", async (req, res) => {
                     recipient_id,
                     tenant_id,
                     sender_id,
-                    sender_name,
-                    metadata,
                     status,
                     created_at
                 ) VALUES (?, ?, ?, ?, 'tenant', ?, ?, ?, ?, ?, 'unread', NOW())
@@ -828,18 +880,13 @@ router.post("/send", async (req, res) => {
                 recipient.id || recipient.tenant_id,
                 recipient.id || recipient.tenant_id,
                 sender_id,
-                sender_name,
-                JSON.stringify({
-                    ...metadata,
-                    tenant_name: recipient.name || recipient.tenant_name
-                })
             ]);
 
             insertedNotifications.push({
                 id: result.insertId,
                 notification_id: notificationId,
                 tenant_id: recipient.id || recipient.tenant_id,
-                tenant_name: recipient.name || recipient.tenant_name
+                name: recipient.name || recipient.name
             });
         }
 
@@ -879,7 +926,6 @@ router.get("/export/csv", async (req, res) => {
         const conn = await pool.getConnection();
         let query = `
             SELECT 
-                notification_id,
                 title,
                 message,
                 type,
@@ -888,7 +934,6 @@ router.get("/export/csv", async (req, res) => {
                 recipient_type,
                 recipient_id,
                 tenant_id,
-                sender_name,
                 created_at,
                 read_at
             FROM notifications
@@ -947,7 +992,6 @@ router.get("/export/csv", async (req, res) => {
             row.recipient_type,
             row.recipient_id || '',
             row.tenant_id || '',
-            row.sender_name || 'System',
             new Date(row.created_at).toISOString(),
             row.read_at ? new Date(row.read_at).toISOString() : ''
         ]);
@@ -1006,7 +1050,6 @@ router.get("/recent/:limit", async (req, res) => {
         const formattedRows = rows.map(row => ({
             ...row,
             formatted_created_at: formatTimestamp(row.created_at),
-            metadata: parseMetadata(row.metadata),
             is_new: row.status === 'unread' || row.status === 'new'
         }));
 
@@ -1060,7 +1103,6 @@ router.get("/recent", async (req, res) => {
         const formattedRows = rows.map(row => ({
             ...row,
             formatted_created_at: formatTimestamp(row.created_at),
-            metadata: parseMetadata(row.metadata),
             is_new: row.status === 'unread' || row.status === 'new'
         }));
 
@@ -1240,7 +1282,7 @@ router.delete("/:id", async (req, res) => {
 
         // First, check if the notification exists
         const [checkResult] = await conn.query(
-            'SELECT * FROM notifications WHERE id = ? OR notification_id = ?',
+            'SELECT * FROM notifications WHERE id = ?',
             [notificationId, notificationId]
         );
 
@@ -1254,7 +1296,7 @@ router.delete("/:id", async (req, res) => {
 
         // Delete the notification
         const [result] = await conn.query(
-            'DELETE FROM notifications WHERE id = ? OR notification_id = ?',
+            'DELETE FROM notifications WHERE id = ?',
             [notificationId, notificationId]
         );
 

@@ -147,10 +147,16 @@ router.get("/", async (req, res) => {
 });
 
 // Get report statistics
+// Get report statistics
 router.get("/stats", async (req, res) => {
+    let conn;
     try {
         const { period = 'month' } = req.query;
-        const conn = await pool.getConnection();
+        conn = await pool.getConnection();
+
+        // First, check table structure for debugging
+        const [tableInfo] = await conn.query(`SHOW COLUMNS FROM reports`);
+        console.log("Reports table columns:", tableInfo);
 
         let dateFilter = '';
         switch (period) {
@@ -185,10 +191,21 @@ router.get("/stats", async (req, res) => {
             `SELECT COUNT(*) as count FROM scheduled_reports WHERE is_active = true`
         );
 
-        // Get total downloads
-        const [downloadsResult] = await conn.query(
-            `SELECT SUM(download_count) as total FROM reports`
-        );
+        // Get total downloads - FIXED: Check if download_count exists
+        let totalDownloads = 0;
+        try {
+            const [downloadsResult] = await conn.query(
+                `SELECT SUM(download_count) as total FROM reports`
+            );
+            totalDownloads = downloadsResult[0].total || 0;
+        } catch (downloadErr) {
+            console.log("download_count column might not exist, using alternative");
+            // Alternative: count reports with specific status or from downloads table
+            const [altDownloadsResult] = await conn.query(
+                `SELECT COUNT(*) as total FROM report_downloads`
+            );
+            totalDownloads = altDownloadsResult[0].total || 0;
+        }
 
         // Get reports by type
         const [typeStats] = await conn.query(`
@@ -204,7 +221,6 @@ router.get("/stats", async (req, res) => {
         // Get recent reports
         const [recentReports] = await conn.query(`
             SELECT 
-                report_id,
                 report_name,
                 report_type,
                 status,
@@ -215,7 +231,6 @@ router.get("/stats", async (req, res) => {
             LIMIT 5
         `);
 
-        // Calculate percentage changes (simplified - you might want to compare with previous period)
         const percentageFromLastMonth = '+12%';
         const percentageThisMonth = '+8%';
         const percentageScheduled = '+2%';
@@ -229,7 +244,7 @@ router.get("/stats", async (req, res) => {
                 total_reports: totalResult[0].total || 0,
                 this_month: monthResult[0].count || 0,
                 scheduled_active: scheduledResult[0].count || 0,
-                total_downloads: downloadsResult[0].total || 0,
+                total_downloads: totalDownloads,
                 type_stats: typeStats,
                 recent_reports: recentReports.map(report => ({
                     ...report,
@@ -247,6 +262,7 @@ router.get("/stats", async (req, res) => {
 
     } catch (err) {
         console.error("Reports stats error:", err);
+        if (conn) conn.release();
         return res.status(500).json({
             success: false,
             message: "Failed to fetch report statistics",
@@ -262,7 +278,7 @@ router.get("/:id", async (req, res) => {
         const conn = await pool.getConnection();
 
         const [rows] = await conn.query(
-            'SELECT * FROM reports WHERE report_id = ? OR id = ?',
+            'SELECT * FROM reports WHERE id = ?',
             [reportId, reportId]
         );
 
@@ -283,7 +299,7 @@ router.get("/:id", async (req, res) => {
         // Log view in analytics
         await conn.query(
             'INSERT INTO report_analytics (report_id, action, user_id, user_role) VALUES (?, ?, ?, ?)',
-            [rows[0].report_id, 'view', 'admin', 'super_admin']
+            [rows[0].id, 'view', 'admin', 'super_admin']
         );
 
         const report = rows[0];
@@ -1285,34 +1301,87 @@ router.get("/analytics/trends", async (req, res) => {
 
 // Get dashboard overview
 router.get("/dashboard/overview", async (req, res) => {
+    let conn;
     try {
-        const conn = await pool.getConnection();
+        conn = await pool.getConnection();
 
-        // Get quick stats
-        const [stats] = await conn.query(`
+        // 1. TOTAL REPORTS
+        const [totalReportsResult] = await conn.query(`
             SELECT 
-                COUNT(*) as total_reports,
-                COUNT(CASE WHEN MONTH(generated_at) = MONTH(CURDATE()) THEN 1 END) as this_month,
-                COUNT(CASE WHEN status = 'processing' THEN 1 END) as processing,
-                COALESCE(SUM(download_count), 0) as total_downloads
+                COUNT(*) as current_total,
+                COALESCE(SUM(CASE WHEN generated_at >= DATE_SUB(NOW(), INTERVAL 1 MONTH) 
+                    AND generated_at < DATE_SUB(NOW(), INTERVAL 0 MONTH) THEN 1 END), 0) as last_month_count
             FROM reports
         `);
+        
+        const currentTotal = totalReportsResult[0].current_total || 0;
+        const lastMonthTotal = totalReportsResult[0].last_month_count || 0;
+        const totalReportsChange = lastMonthTotal > 0 
+            ? `${(((currentTotal - lastMonthTotal) / lastMonthTotal) * 100).toFixed(0)}%`
+            : '+0%';
 
-        // Get report types distribution
+        // 2. THIS MONTH REPORTS
+        const [thisMonthResult] = await conn.query(`
+            SELECT 
+                COUNT(CASE WHEN MONTH(generated_at) = MONTH(CURDATE()) 
+                    AND YEAR(generated_at) = YEAR(CURDATE()) THEN 1 END) as current_month,
+                COUNT(CASE WHEN MONTH(generated_at) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH))
+                    AND YEAR(generated_at) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 END) as last_month
+            FROM reports
+        `);
+        
+        const currentMonthCount = thisMonthResult[0].current_month || 0;
+        const lastMonthCount = thisMonthResult[0].last_month || 0;
+        const thisMonthChange = lastMonthCount > 0 
+            ? `${(((currentMonthCount - lastMonthCount) / lastMonthCount) * 100).toFixed(0)}%`
+            : '+0%';
+
+        // 3. SCHEDULED ACTIVE REPORTS
+        const [scheduledResult] = await conn.query(`
+            SELECT 
+                COUNT(CASE WHEN is_active = true THEN 1 END) as active_count,
+                COUNT(CASE WHEN is_active = false THEN 1 END) as inactive_count
+            FROM scheduled_reports
+        `);
+        
+        const scheduledActive = scheduledResult[0].active_count || 0;
+        const scheduledInactive = scheduledResult[0].inactive_count || 0;
+        const totalScheduled = scheduledActive + scheduledInactive;
+        const scheduledChange = totalScheduled > 0 
+            ? `${((scheduledActive / totalScheduled) * 100).toFixed(0)}% active`
+            : '0% active';
+
+        // 4. TOTAL DOWNLOADS
+        const [downloadsResult] = await conn.query(`
+            SELECT 
+                COALESCE(SUM(download_count), 0) as current_downloads,
+                COALESCE(SUM(CASE WHEN generated_at >= DATE_SUB(NOW(), INTERVAL 1 MONTH) 
+                    AND generated_at < DATE_SUB(NOW(), INTERVAL 0 MONTH) THEN download_count END), 0) as last_month_downloads
+            FROM reports
+        `);
+        
+        const currentDownloads = downloadsResult[0].current_downloads || 0;
+        const lastMonthDownloads = downloadsResult[0].last_month_downloads || 0;
+        const downloadsChange = lastMonthDownloads > 0 
+            ? `${(((currentDownloads - lastMonthDownloads) / lastMonthDownloads) * 100).toFixed(0)}%`
+            : '+0%';
+
+        // 5. REPORT TYPES DISTRIBUTION
         const [typeDistribution] = await conn.query(`
             SELECT 
                 report_type,
-                COUNT(*) as count
+                COUNT(*) as count,
+                ROUND((COUNT(*) * 100.0 / (SELECT COUNT(*) FROM reports)), 1) as percentage
             FROM reports
             GROUP BY report_type
             ORDER BY count DESC
             LIMIT 5
         `);
 
-        // Get recent reports
+        // 6. RECENT REPORTS
         const [recentReports] = await conn.query(`
             SELECT 
-                report_id,
+                id as report_id,
                 report_name,
                 report_type,
                 status,
@@ -1324,31 +1393,55 @@ router.get("/dashboard/overview", async (req, res) => {
             LIMIT 5
         `);
 
-        // Get active schedules
+        // 7. ACTIVE SCHEDULES
         const [activeSchedules] = await conn.query(`
             SELECT 
                 schedule_id,
                 schedule_name,
                 report_type,
                 frequency,
-                next_run
+                next_run,
+                is_active
             FROM scheduled_reports
             WHERE is_active = true
             ORDER BY next_run ASC
             LIMIT 5
         `);
 
-        // Get top performers
+        // 8. TOP PERFORMERS (Most Downloaded)
         const [topPerformers] = await conn.query(`
             SELECT 
-                report_id,
+                id as report_id,
                 report_name,
                 report_type,
                 download_count,
-                view_count
+                generated_at
             FROM reports
-            ORDER BY download_count DESC
+            ORDER BY download_count DESC, generated_at DESC
             LIMIT 5
+        `);
+
+        // 9. STATUS DISTRIBUTION
+        const [statusDistribution] = await conn.query(`
+            SELECT 
+                status,
+                COUNT(*) as count,
+                ROUND((COUNT(*) * 100.0 / (SELECT COUNT(*) FROM reports)), 1) as percentage
+            FROM reports
+            GROUP BY status
+            ORDER BY count DESC
+        `);
+
+        // 10. MONTHLY TREND (Last 6 months)
+        const [monthlyTrend] = await conn.query(`
+            SELECT 
+                DATE_FORMAT(generated_at, '%Y-%m') as month,
+                COUNT(*) as report_count,
+                COALESCE(SUM(download_count), 0) as download_count
+            FROM reports
+            WHERE generated_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+            GROUP BY DATE_FORMAT(generated_at, '%Y-%m')
+            ORDER BY month DESC
         `);
 
         conn.release();
@@ -1356,27 +1449,76 @@ router.get("/dashboard/overview", async (req, res) => {
         return res.json({
             success: true,
             data: {
+                // Main Stats Cards
                 stats: {
-                    total_reports: stats[0].total_reports || 0,
-                    this_month: stats[0].this_month || 0,
-                    processing: stats[0].processing || 0,
-                    total_downloads: stats[0].total_downloads || 0
+                    total_reports: {
+                        value: currentTotal,
+                        change: totalReportsChange,
+                        icon: "📊",
+                        description: "Total number of generated reports"
+                    },
+                    this_month: {
+                        value: currentMonthCount,
+                        change: thisMonthChange,
+                        icon: "📅",
+                        description: "Reports generated this month"
+                    },
+                    scheduled_active: {
+                        value: scheduledActive,
+                        change: scheduledChange,
+                        icon: "⏰",
+                        description: "Active scheduled reports"
+                    },
+                    total_downloads: {
+                        value: currentDownloads,
+                        change: downloadsChange,
+                        icon: "⬇️",
+                        description: "Total report downloads"
+                    }
                 },
-                type_distribution: typeDistribution,
-                recent_reports: recentReports.map(report => ({
-                    ...report,
-                    formatted_generated_at: formatDate(report.generated_at)
-                })),
-                active_schedules: activeSchedules.map(schedule => ({
-                    ...schedule,
-                    formatted_next_run: formatDate(schedule.next_run)
-                })),
-                top_performers: topPerformers
+                
+                // Charts & Distributions
+                charts: {
+                    type_distribution: typeDistribution,
+                    status_distribution: statusDistribution,
+                    monthly_trend: monthlyTrend
+                },
+                
+                // Lists & Tables
+                lists: {
+                    recent_reports: recentReports.map(report => ({
+                        ...report,
+                        formatted_generated_at: formatDate(report.generated_at),
+                        file_size_formatted: formatFileSize(report.file_size)
+                    })),
+                    active_schedules: activeSchedules.map(schedule => ({
+                        ...schedule,
+                        formatted_next_run: formatDate(schedule.next_run),
+                        status: schedule.is_active ? "Active" : "Inactive"
+                    })),
+                    top_performers: topPerformers.map(report => ({
+                        ...report,
+                        formatted_generated_at: formatDate(report.generated_at),
+                        performance_score: report.download_count || 0
+                    }))
+                },
+                
+                // Summary
+                summary: {
+                    total_scheduled: totalScheduled,
+                    average_file_size: recentReports.length > 0 
+                        ? formatFileSize(recentReports.reduce((sum, r) => sum + (r.file_size || 0), 0) / recentReports.length)
+                        : "0 KB",
+                    success_rate: statusDistribution.find(s => s.status === 'completed') 
+                        ? `${statusDistribution.find(s => s.status === 'completed').percentage}%`
+                        : "0%"
+                }
             }
         });
 
     } catch (err) {
         console.error("Dashboard overview error:", err);
+        if (conn) conn.release();
         return res.status(500).json({
             success: false,
             message: "Failed to fetch dashboard overview",
@@ -1384,7 +1526,6 @@ router.get("/dashboard/overview", async (req, res) => {
         });
     }
 });
-
 // ==================== BULK OPERATIONS ====================
 
 // Bulk delete reports - using only 'id' column
