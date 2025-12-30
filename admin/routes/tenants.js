@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../../db/connection.js");
 const { v4: uuidv4 } = require('uuid');
+const { authenticateToken } = require("./auth.js");
 
 // ==================== TENANTS API ====================
 
@@ -1234,4 +1235,889 @@ router.get("/export/tenants", async (req, res) => {
     }
 });
 
+
+
+// new list 
+router.get("/ten-new", authenticateToken, async (req, res) => {
+  try {
+    const {
+      search,
+      status,
+      plan,
+      deployment_type,
+      is_self_hosted,
+      page = 1,
+      limit = 10
+    } = req.query;
+
+    const conn = await pool.getConnection();
+    
+    // Build WHERE clause dynamically
+    let whereClauses = [];
+    let queryParams = [];
+    
+    if (search) {
+      whereClauses.push(`(name LIKE ? OR email LIKE ?)`);
+      const searchTerm = `%${search}%`;
+      queryParams.push(searchTerm, searchTerm);
+    }
+    
+    if (status && status !== 'all' && status !== 'All Statuses') {
+      whereClauses.push(`status = ?`);
+      queryParams.push(status);
+    }
+    
+    if (plan && plan !== 'all' && plan !== 'All Plans') {
+      whereClauses.push(`plan = ?`);
+      queryParams.push(plan);
+    }
+    
+    if (deployment_type && deployment_type !== 'all' && deployment_type !== 'All Types') {
+      whereClauses.push(`deployment_type = ?`);
+      queryParams.push(deployment_type);
+    }
+    
+    if (is_self_hosted !== undefined) {
+      whereClauses.push(`is_self_hosted = ?`);
+      queryParams.push(parseInt(is_self_hosted));
+    }
+    
+    const whereClause = whereClauses.length > 0 
+      ? `WHERE ${whereClauses.join(' AND ')}` 
+      : '';
+    
+    // Get total count for pagination
+    const countQuery = `SELECT COUNT(*) as total FROM tenants ${whereClause}`;
+    const [countRows] = await conn.query(countQuery, queryParams);
+    const total = countRows[0].total;
+    
+    // Calculate pagination
+    const offset = (page - 1) * limit;
+    
+    // Get tenants data
+    const query = `
+      SELECT 
+        id, name, email, contact_name, status, health_status, plan,
+        deployment_type, is_self_hosted, is_self_managed, max_users,
+        active_users, mrr, created_at, license_key, license_expires_at,
+        instance_url, server_ip, server_status, database_type,
+        last_heartbeat, installation_date, trial_ends_at, notes
+      FROM tenants 
+      ${whereClause}
+      ORDER BY created_at DESC
+      LIMIT ? OFFSET ?
+    `;
+    
+    const finalParams = [...queryParams, parseInt(limit), offset];
+    const [rows] = await conn.query(query, finalParams);
+    
+    // Get summary statistics
+    const statsQuery = `
+      SELECT 
+        COUNT(*) as total_tenants,
+        SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active_tenants,
+        SUM(CASE WHEN deployment_type = 'centralized' THEN 1 ELSE 0 END) as centralized_tenants,
+        SUM(CASE WHEN deployment_type = 'self-hosted' THEN 1 ELSE 0 END) as self_hosted_tenants,
+        COALESCE(SUM(mrr), 0) as total_mrr,
+        COALESCE(AVG(mrr), 0) as avg_mrr
+      FROM tenants
+    `;
+    
+    const [statsRows] = await conn.query(statsQuery);
+    
+    conn.release();
+    
+    return res.json({
+      success: true,
+      data: rows,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        totalPages: Math.ceil(total / limit)
+      },
+      stats: statsRows[0],
+      filters: {
+        search,
+        status,
+        plan,
+        deployment_type,
+        is_self_hosted
+      }
+    });
+    
+  } catch (err) {
+    console.error("Get tenants error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch tenants",
+      error: err.message
+    });
+  }
+});
+
+
+
+router.get("/ten-new/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const conn = await pool.getConnection();
+    
+    const [rows] = await conn.query(
+      `SELECT 
+        id, name, email, contact_name, status, health_status, plan,
+        deployment_type, is_self_hosted, is_self_managed, max_users,
+        active_users, mrr, created_at, updated_at, license_key, 
+        license_expires_at, instance_url, server_ip, server_status, 
+        database_type, last_heartbeat, installation_date, trial_ends_at,
+        subscription_id, notes, metadata
+      FROM tenants 
+      WHERE id = ?`,
+      [id]
+    );
+    
+    conn.release();
+    
+    if (rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Tenant not found"
+      });
+    }
+    
+    return res.json({
+      success: true,
+      data: rows[0]
+    });
+    
+  } catch (err) {
+    console.error("Get tenant error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch tenant",
+      error: err.message
+    });
+  }
+});
+
+
+router.post("/ten-new", authenticateToken, async (req, res) => {
+  try {
+    const {
+      name,
+      email,
+      contact_name,
+      plan,
+      deployment_type,
+      max_users,
+      active_users = 0,
+      mrr = 0.00,
+      status = 'active',
+      license_key,
+      license_expires_at,
+      instance_url,
+      server_ip,
+      trial_ends_at,
+      notes
+    } = req.body;
+    
+    // Basic validation
+    if (!name || !email || !plan || !deployment_type) {
+      return res.status(400).json({
+        success: false,
+        message: "Name, email, plan, and deployment type are required"
+      });
+    }
+    
+    const conn = await pool.getConnection();
+    
+    // Check if tenant with same email already exists
+    const [existingRows] = await conn.query(
+      'SELECT id FROM tenants WHERE email = ?',
+      [email]
+    );
+    
+    if (existingRows.length > 0) {
+      conn.release();
+      return res.status(409).json({
+        success: false,
+        message: "Tenant with this email already exists"
+      });
+    }
+    
+    // Set derived fields
+    const is_self_hosted = deployment_type === 'self-hosted' ? 1 : 0;
+    const is_self_managed = deployment_type === 'self-hosted' ? 1 : 0;
+    const server_status = is_self_hosted ? 'offline' : null;
+    const health_status = 'healthy';
+    
+    // Insert new tenant
+    const [result] = await conn.query(
+      `INSERT INTO tenants (
+        name, email, contact_name, status, health_status, plan,
+        deployment_type, is_self_hosted, is_self_managed, max_users,
+        active_users, mrr, license_key, license_expires_at, instance_url,
+        server_ip, server_status, trial_ends_at, notes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        name, email, contact_name, status, health_status, plan,
+        deployment_type, is_self_hosted, is_self_managed, max_users,
+        active_users, mrr, license_key, license_expires_at, instance_url,
+        server_ip, server_status, trial_ends_at, notes
+      ]
+    );
+    
+    // Get the created tenant
+    const [newTenantRows] = await conn.query(
+      'SELECT * FROM tenants WHERE id = ?',
+      [result.insertId]
+    );
+    
+    conn.release();
+    
+    return res.status(201).json({
+      success: true,
+      message: "Tenant created successfully",
+      data: newTenantRows[0]
+    });
+    
+  } catch (err) {
+    console.error("Create tenant error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to create tenant",
+      error: err.message
+    });
+  }
+});
+
+
+router.put("/ten-new/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+    
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        message: "Tenant ID is required"
+      });
+    }
+    
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No data to update"
+      });
+    }
+    
+    const conn = await pool.getConnection();
+    
+    // Check if tenant exists
+    const [existingRows] = await conn.query(
+      'SELECT id FROM tenants WHERE id = ?',
+      [id]
+    );
+    
+    if (existingRows.length === 0) {
+      conn.release();
+      return res.status(404).json({
+        success: false,
+        message: "Tenant not found"
+      });
+    }
+    
+    // Check if email is being updated and if it's already taken
+    if (updateData.email) {
+      const [emailRows] = await conn.query(
+        'SELECT id FROM tenants WHERE email = ? AND id != ?',
+        [updateData.email, id]
+      );
+      
+      if (emailRows.length > 0) {
+        conn.release();
+        return res.status(409).json({
+          success: false,
+          message: "Email already taken by another tenant"
+        });
+      }
+    }
+    
+    // Update derived fields if deployment_type changes
+    if (updateData.deployment_type) {
+      updateData.is_self_hosted = updateData.deployment_type === 'self-hosted' ? 1 : 0;
+      updateData.is_self_managed = updateData.deployment_type === 'self-hosted' ? 1 : 0;
+    }
+    
+    // Update tenant
+    const [result] = await conn.query(
+      'UPDATE tenants SET ? WHERE id = ?',
+      [updateData, id]
+    );
+    
+    // Get updated tenant
+    const [updatedRows] = await conn.query(
+      'SELECT * FROM tenants WHERE id = ?',
+      [id]
+    );
+    
+    conn.release();
+    
+    return res.json({
+      success: true,
+      message: "Tenant updated successfully",
+      data: updatedRows[0]
+    });
+    
+  } catch (err) {
+    console.error("Update tenant error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update tenant",
+      error: err.message
+    });
+  }
+});
+
+
+router.delete("/ten-new/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const conn = await pool.getConnection();
+    
+    // Check if tenant exists
+    const [existingRows] = await conn.query(
+      'SELECT id FROM tenants WHERE id = ?',
+      [id]
+    );
+    
+    if (existingRows.length === 0) {
+      conn.release();
+      return res.status(404).json({
+        success: false,
+        message: "Tenant not found"
+      });
+    }
+    
+    // Delete tenant
+    await conn.query(
+      'DELETE FROM tenants WHERE id = ?',
+      [id]
+    );
+    
+    conn.release();
+    
+    return res.json({
+      success: true,
+      message: "Tenant deleted successfully"
+    });
+    
+  } catch (err) {
+    console.error("Delete tenant error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete tenant",
+      error: err.message
+    });
+  }
+});
+
+
+router.post("/ten-new/:id/suspend", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const conn = await pool.getConnection();
+    
+    const [result] = await conn.query(
+      'UPDATE tenants SET status = "suspended" WHERE id = ?',
+      [id]
+    );
+    
+    conn.release();
+    
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Tenant not found"
+      });
+    }
+    
+    return res.json({
+      success: true,
+      message: "Tenant suspended successfully"
+    });
+    
+  } catch (err) {
+    console.error("Suspend tenant error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to suspend tenant",
+      error: err.message
+    });
+  }
+});
+
+
+router.post("/ten-new/:id/activate", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const conn = await pool.getConnection();
+    
+    const [result] = await conn.query(
+      'UPDATE tenants SET status = "active" WHERE id = ?',
+      [id]
+    );
+    
+    conn.release();
+    
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Tenant not found"
+      });
+    }
+    
+    return res.json({
+      success: true,
+      message: "Tenant activated successfully"
+    });
+    
+  } catch (err) {
+    console.error("Activate tenant error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to activate tenant",
+      error: err.message
+    });
+  }
+});
+
+
+
+router.post("/ten-new/:id/cancel", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const conn = await pool.getConnection();
+    
+    const [result] = await conn.query(
+      'UPDATE tenants SET status = "cancelled" WHERE id = ?',
+      [id]
+    );
+    
+    conn.release();
+    
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Tenant not found"
+      });
+    }
+    
+    return res.json({
+      success: true,
+      message: "Tenant cancelled successfully"
+    });
+    
+  } catch (err) {
+    console.error("Cancel tenant error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to cancel tenant",
+      error: err.message
+    });
+  }
+});
+
+// ==================== LICENSE MANAGEMENT API ====================
+
+// Update license information
+router.put("/ten-new/:id/license", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      license_key,
+      license_expires_at,
+      instance_url,
+      server_ip,
+      database_type,
+      installation_date
+    } = req.body;
+    
+    const conn = await pool.getConnection();
+    
+    // Build update object
+    const updateData = {};
+    if (license_key !== undefined) updateData.license_key = license_key;
+    if (license_expires_at !== undefined) updateData.license_expires_at = license_expires_at;
+    if (instance_url !== undefined) updateData.instance_url = instance_url;
+    if (server_ip !== undefined) updateData.server_ip = server_ip;
+    if (database_type !== undefined) updateData.database_type = database_type;
+    if (installation_date !== undefined) updateData.installation_date = installation_date;
+    
+    if (Object.keys(updateData).length === 0) {
+      conn.release();
+      return res.status(400).json({
+        success: false,
+        message: "No license data to update"
+      });
+    }
+    
+    const [result] = await conn.query(
+      'UPDATE tenants SET ? WHERE id = ?',
+      [updateData, id]
+    );
+    
+    conn.release();
+    
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Tenant not found"
+      });
+    }
+    
+    return res.json({
+      success: true,
+      message: "License information updated successfully"
+    });
+    
+  } catch (err) {
+    console.error("Update license error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update license information",
+      error: err.message
+    });
+  }
+});
+
+// Update server heartbeat
+router.post("/ten-new/:id/heartbeat", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { server_status = 'online' } = req.body;
+    
+    const conn = await pool.getConnection();
+    
+    const [result] = await conn.query(
+      'UPDATE tenants SET last_heartbeat = NOW(), server_status = ? WHERE id = ?',
+      [server_status, id]
+    );
+    
+    conn.release();
+    
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Tenant not found"
+      });
+    }
+    
+    return res.json({
+      success: true,
+      message: "Heartbeat updated successfully"
+    });
+    
+  } catch (err) {
+    console.error("Update heartbeat error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update heartbeat",
+      error: err.message
+    });
+  }
+});
+
+// Validate license key
+router.post("/ten-new/license/validate", authenticateToken, async (req, res) => {
+  try {
+    const { license_key } = req.body;
+    
+    if (!license_key) {
+      return res.status(400).json({
+        success: false,
+        message: "License key is required"
+      });
+    }
+    
+    const conn = await pool.getConnection();
+    
+    const [rows] = await conn.query(
+      `SELECT 
+        id, name, license_key, license_expires_at,
+        status, plan, max_users
+      FROM tenants 
+      WHERE license_key = ?`,
+      [license_key]
+    );
+    
+    conn.release();
+    
+    if (rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "License key not found"
+      });
+    }
+    
+    const license = rows[0];
+    const now = new Date();
+    const expiresAt = new Date(license.license_expires_at);
+    const isValid = expiresAt > now && license.status === 'active';
+    
+    return res.json({
+      success: true,
+      data: {
+        ...license,
+        is_valid: isValid,
+        expires_in_days: isValid ? Math.ceil((expiresAt - now) / (1000 * 60 * 60 * 24)) : 0
+      }
+    });
+    
+  } catch (err) {
+    console.error("Validate license error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to validate license",
+      error: err.message
+    });
+  }
+});
+
+// ==================== STATISTICS API ====================
+
+// Get tenants statistics
+router.get("/ten-new/stats/overview", authenticateToken, async (req, res) => {
+  try {
+    const conn = await pool.getConnection();
+    
+    // Get current month stats
+    const currentMonthQuery = `
+      SELECT 
+        COUNT(*) as total_tenants,
+        SUM(CASE WHEN deployment_type = 'centralized' THEN 1 ELSE 0 END) as centralized,
+        SUM(CASE WHEN deployment_type = 'self-hosted' THEN 1 ELSE 0 END) as self_hosted,
+        COALESCE(SUM(mrr), 0) as total_mrr
+      FROM tenants
+      WHERE status = 'active'
+    `;
+    
+    const [currentRows] = await conn.query(currentMonthQuery);
+    
+    // Get previous month stats for comparison
+    const prevMonthQuery = `
+      SELECT 
+        COUNT(*) as total_tenants,
+        SUM(CASE WHEN deployment_type = 'centralized' THEN 1 ELSE 0 END) as centralized,
+        SUM(CASE WHEN deployment_type = 'self-hosted' THEN 1 ELSE 0 END) as self_hosted,
+        COALESCE(SUM(mrr), 0) as total_mrr
+      FROM tenants
+      WHERE status = 'active'
+      AND MONTH(created_at) = MONTH(DATE_SUB(NOW(), INTERVAL 1 MONTH))
+      AND YEAR(created_at) = YEAR(DATE_SUB(NOW(), INTERVAL 1 MONTH))
+    `;
+    
+    const [prevRows] = await conn.query(prevMonthQuery);
+    
+    // Calculate percentages
+    const calculatePercentage = (current, previous) => {
+      if (previous === 0) return current > 0 ? 100 : 0;
+      return Math.round(((current - previous) / previous) * 100);
+    };
+    
+    const stats = {
+      total_tenants: {
+        current: currentRows[0].total_tenants || 0,
+        previous: prevRows[0]?.total_tenants || 0,
+        percentage: calculatePercentage(
+          currentRows[0].total_tenants || 0,
+          prevRows[0]?.total_tenants || 0
+        )
+      },
+      centralized: {
+        current: currentRows[0].centralized || 0,
+        previous: prevRows[0]?.centralized || 0,
+        percentage: calculatePercentage(
+          currentRows[0].centralized || 0,
+          prevRows[0]?.centralized || 0
+        )
+      },
+      self_hosted: {
+        current: currentRows[0].self_hosted || 0,
+        previous: prevRows[0]?.self_hosted || 0,
+        percentage: calculatePercentage(
+          currentRows[0].self_hosted || 0,
+          prevRows[0]?.self_hosted || 0
+        )
+      },
+      total_mrr: {
+        current: currentRows[0].total_mrr || 0,
+        previous: prevRows[0]?.total_mrr || 0,
+        percentage: calculatePercentage(
+          currentRows[0].total_mrr || 0,
+          prevRows[0]?.total_mrr || 0
+        )
+      }
+    };
+    
+    // Get status distribution
+    const statusQuery = `
+      SELECT 
+        status,
+        COUNT(*) as count
+      FROM tenants
+      GROUP BY status
+    `;
+    
+    const [statusRows] = await conn.query(statusQuery);
+    
+    // Get plan distribution
+    const planQuery = `
+      SELECT 
+        plan,
+        COUNT(*) as count,
+        COALESCE(SUM(mrr), 0) as total_mrr
+      FROM tenants
+      WHERE plan IS NOT NULL
+      GROUP BY plan
+    `;
+    
+    const [planRows] = await conn.query(planQuery);
+    
+    conn.release();
+    
+    return res.json({
+      success: true,
+      data: {
+        overview: stats,
+        status_distribution: statusRows,
+        plan_distribution: planRows
+      }
+    });
+    
+  } catch (err) {
+    console.error("Get stats error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch statistics",
+      error: err.message
+    });
+  }
+});
+
+// Get MRR trends
+router.get("/ten-new/stats/mrr-trend", authenticateToken, async (req, res) => {
+  try {
+    const { months = 6 } = req.query;
+    const conn = await pool.getConnection();
+    
+    const query = `
+      SELECT 
+        DATE_FORMAT(created_at, '%Y-%m') as month,
+        COUNT(*) as new_tenants,
+        COALESCE(SUM(mrr), 0) as mrr_added,
+        (
+          SELECT COALESCE(SUM(mrr), 0)
+          FROM tenants t2
+          WHERE DATE_FORMAT(t2.created_at, '%Y-%m') <= DATE_FORMAT(tenants.created_at, '%Y-%m')
+          AND t2.status = 'active'
+        ) as cumulative_mrr
+      FROM tenants
+      WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? MONTH)
+      AND status = 'active'
+      GROUP BY DATE_FORMAT(created_at, '%Y-%m')
+      ORDER BY month
+    `;
+    
+    const [rows] = await conn.query(query, [parseInt(months)]);
+    conn.release();
+    
+    return res.json({
+      success: true,
+      data: rows
+    });
+    
+  } catch (err) {
+    console.error("Get MRR trend error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch MRR trends",
+      error: err.message
+    });
+  }
+});
+
+// Export tenants to CSV/Excel
+router.get("/ten-new/export", authenticateToken, async (req, res) => {
+  try {
+    const { format = 'csv' } = req.query;
+    const conn = await pool.getConnection();
+    
+    const [rows] = await conn.query(`
+      SELECT 
+        id,
+        name,
+        email,
+        contact_name,
+        status,
+        plan,
+        deployment_type,
+        max_users,
+        active_users,
+        mrr,
+        DATE_FORMAT(created_at, '%Y-%m-%d') as created_date,
+        license_key,
+        DATE_FORMAT(license_expires_at, '%Y-%m-%d') as license_expiry,
+        instance_url,
+        server_status,
+        database_type,
+        DATE_FORMAT(last_heartbeat, '%Y-%m-%d %H:%i:%s') as last_heartbeat
+      FROM tenants
+      ORDER BY created_at DESC
+    `);
+    
+    conn.release();
+    
+    if (format === 'json') {
+      return res.json({
+        success: true,
+        data: rows
+      });
+    }
+    
+    // Generate CSV
+    if (rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No data to export"
+      });
+    }
+    
+    // Convert to CSV
+    const headers = Object.keys(rows[0]).join(',');
+    const csvRows = rows.map(row => 
+      Object.values(row).map(value => 
+        `"${value !== null ? value.toString().replace(/"/g, '""') : ''}"`
+      ).join(',')
+    );
+    
+    const csvContent = [headers, ...csvRows].join('\n');
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=tenants-export.csv');
+    res.send(csvContent);
+    
+  } catch (err) {
+    console.error("Export error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to export tenants",
+      error: err.message
+    });
+  }
+});
 module.exports = router;
