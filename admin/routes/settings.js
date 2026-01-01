@@ -1563,4 +1563,674 @@ router.post("webhook/:id/test", async (req, res) => {
     }
 });
 
+
+
+
+
+// PUT /api/email-settings
+router.put("/email-settings/emails", async (req, res) => {
+    try {
+        const {
+            email_provider,
+            smtp_host,
+            smtp_port,
+            smtp_username,
+            smtp_password,
+            smtp_encryption,
+            api_key,
+            api_secret,
+            from_email,
+            from_name,
+            reply_to_email,
+            reply_to_name,
+            is_active,
+            max_retries,
+            retry_delay,
+            timeout,
+            debug_mode,
+            extra_config
+        } = req.body;
+
+        console.log("Received email settings update:", {
+            email_provider,
+            smtp_host,
+            smtp_port,
+            from_email,
+            from_name,
+            is_active
+        });
+
+        // Basic validation
+        if (!from_email || !from_name) {
+            return res.status(400).json({
+                success: false,
+                message: "From email and name are required"
+            });
+        }
+
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(from_email)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid from email format"
+            });
+        }
+
+        if (reply_to_email && !emailRegex.test(reply_to_email)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid reply-to email format"
+            });
+        }
+
+        const conn = await pool.getConnection();
+        
+        try {
+            // Check if settings exist
+            const [existing] = await conn.query(
+                "SELECT id FROM system_email_settings"
+            );
+
+            let query;
+            let queryParams;
+
+            if (existing.length === 0) {
+                // INSERT new settings
+                query = `
+                    INSERT INTO system_email_settings SET 
+                        email_provider = ?,
+                        smtp_host = ?,
+                        smtp_port = ?,
+                        smtp_username = ?,
+                        smtp_password = ?,
+                        smtp_encryption = ?,
+                        api_key = ?,
+                        api_secret = ?,
+                        from_email = ?,
+                        from_name = ?,
+                        reply_to_email = ?,
+                        reply_to_name = ?,
+                        is_active = ?,
+                        max_retries = ?,
+                        retry_delay = ?,
+                        timeout = ?,
+                        debug_mode = ?,
+                        extra_config = ?,
+                        created_at = NOW(),
+                        updated_at = NOW()
+                `;
+                
+                queryParams = [
+                    email_provider || 'smtp',
+                    smtp_host || null,
+                    smtp_port || 587,
+                    smtp_username || null,
+                    smtp_password || null,
+                    smtp_encryption || 'tls',
+                    api_key || null,
+                    api_secret || null,
+                    from_email,
+                    from_name,
+                    reply_to_email || null,
+                    reply_to_name || null,
+                    is_active || false,
+                    max_retries || 3,
+                    retry_delay || 5,
+                    timeout || 30,
+                    debug_mode || false,
+                    extra_config ? JSON.stringify(extra_config) : null
+                ];
+            } else {
+                // UPDATE existing settings
+                // First get current settings
+                const [current] = await conn.query(
+                    "SELECT smtp_password, api_secret FROM system_email_settings LIMIT 1"
+                );
+                
+                const currentSettings = current[0] || {};
+                
+                query = `
+                    UPDATE system_email_settings SET 
+                        email_provider = ?,
+                        smtp_host = ?,
+                        smtp_port = ?,
+                        smtp_username = ?,
+                        smtp_password = ?,
+                        smtp_encryption = ?,
+                        api_key = ?,
+                        api_secret = ?,
+                        from_email = ?,
+                        from_name = ?,
+                        reply_to_email = ?,
+                        reply_to_name = ?,
+                        is_active = ?,
+                        max_retries = ?,
+                        retry_delay = ?,
+                        timeout = ?,
+                        debug_mode = ?,
+                        extra_config = ?,
+                        updated_at = NOW()
+                    WHERE id = 1
+                `;
+                
+                // Handle password updates: if password is provided, use it; otherwise keep existing
+                const finalPassword = smtp_password !== undefined ? smtp_password : currentSettings.smtp_password;
+                const finalApiSecret = api_secret !== undefined ? api_secret : currentSettings.api_secret;
+                
+                queryParams = [
+                    email_provider || 'smtp',
+                    smtp_host || null,
+                    smtp_port || 587,
+                    smtp_username || null,
+                    finalPassword,
+                    smtp_encryption || 'tls',
+                    api_key || null,
+                    finalApiSecret,
+                    from_email,
+                    from_name,
+                    reply_to_email || null,
+                    reply_to_name || null,
+                    is_active || false,
+                    max_retries || 3,
+                    retry_delay || 5,
+                    timeout || 30,
+                    debug_mode || false,
+                    extra_config ? JSON.stringify(extra_config) : null
+                ];
+            }
+
+            console.log("Executing query with params:", queryParams);
+            await conn.query(query, queryParams);
+
+            // Get updated settings (without sensitive data)
+            const [updated] = await conn.query(
+                `SELECT 
+                    id,
+                    email_provider,
+                    smtp_host,
+                    smtp_port,
+                    smtp_username,
+                    smtp_encryption,
+                    from_email,
+                    from_name,
+                    reply_to_email,
+                    reply_to_name,
+                    is_active,
+                    test_connection_status,
+                    test_connection_message,
+                    last_tested_at,
+                    debug_mode,
+                    created_at,
+                    updated_at
+                FROM system_email_settings LIMIT 1`
+            );
+
+            conn.release();
+
+            if (updated.length === 0) {
+                return res.status(500).json({
+                    success: false,
+                    message: "Failed to retrieve updated settings"
+                });
+            }
+
+            return res.json({
+                success: true,
+                message: "Email settings updated successfully",
+                data: updated[0]
+            });
+
+        } catch (error) {
+            console.error("Database error in email settings:", error);
+            conn.release();
+            
+            return res.status(500).json({
+                success: false,
+                message: "Database operation failed",
+                error: error.message
+            });
+        }
+
+    } catch (err) {
+        console.error("Update email settings error:", err);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to update email settings",
+            error: err.message
+        });
+    }
+});
+// GET /api/email-settings
+router.get("/email-settings/emails", async (req, res) => {
+    try {
+        // Query to get the single email settings record
+        const [settings] = await pool.query(
+            `SELECT 
+                id,
+                email_provider,
+                smtp_host,
+                smtp_port,
+                smtp_username,
+                smtp_password,
+                smtp_encryption,
+                api_key,
+                api_secret,
+                from_email,
+                from_name,
+                reply_to_email,
+                reply_to_name,
+                is_active,
+                test_connection_status,
+                test_connection_message,
+                last_tested_at,
+                max_retries,
+                retry_delay,
+                timeout,
+                debug_mode,
+                extra_config,
+                created_at,
+                updated_at
+            FROM system_email_settings 
+            LIMIT 1`
+        );
+
+        // If no settings exist, create default ones
+        if (settings.length === 0) {
+            console.log("No email settings found, creating default...");
+            
+            // Create default settings
+            await pool.query(
+                `INSERT INTO system_email_settings (
+                    email_provider,
+                    smtp_host,
+                    smtp_port,
+                    smtp_username,
+                    smtp_password,
+                    smtp_encryption,
+                    from_email,
+                    from_name,
+                    is_active,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+                [
+                    'smtp',
+                    'smtp.example.com',
+                    587,
+                    'your-username',
+                    '',
+                    'tls',
+                    'noreply@yourdomain.com',
+                    'Visit Tracking Pro',
+                    false
+                ]
+            );
+            
+            // Fetch the newly created settings
+            const [newSettings] = await pool.query(
+                "SELECT * FROM system_email_settings LIMIT 1"
+            );
+            
+            if (newSettings.length === 0) {
+                return res.status(500).json({
+                    success: false,
+                    message: "Failed to create default email settings"
+                });
+            }
+            
+            const setting = newSettings[0];
+            
+            // Mask sensitive fields for response
+            const responseData = {
+                ...setting,
+                smtp_password: setting.smtp_password ? '••••••••' : '',
+                api_secret: setting.api_secret ? '••••••••' : ''
+            };
+            
+            return res.json({
+                success: true,
+                message: "Default email settings created",
+                data: responseData
+            });
+        }
+
+        // Settings exist, return them
+        const setting = settings[0];
+        
+        // Mask sensitive fields for response (for security)
+        const responseData = {
+            ...setting,
+            smtp_password: setting.smtp_password ? '••••••••' : '',
+            api_secret: setting.api_secret ? '••••••••' : ''
+        };
+
+        return res.json({
+            success: true,
+            data: responseData
+        });
+
+    } catch (err) {
+        console.error("Get email settings error:", err);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch email settings",
+            error: err.message
+        });
+    }
+});
+// Helper function to get email settings
+async function getEmailSettings() {
+    const [settings] = await pool.query(
+        "SELECT * FROM system_email_settings WHERE id = 1"
+    );
+    return settings[0] || null;
+}
+
+// Helper function to create default email settings
+async function createDefaultEmailSettings() {
+    await pool.query(
+        `INSERT INTO system_email_settings (
+            email_provider,
+            smtp_host,
+            smtp_port,
+            smtp_username,
+            smtp_password,
+            smtp_encryption,
+            from_email,
+            from_name,
+            is_active,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+        [
+            'smtp',
+            'smtp.example.com',
+            587,
+            'your-username',
+            '',
+            'tls',
+            'noreply@yourdomain.com',
+            'Visit Tracking Pro',
+            false
+        ]
+    );
+}
+
+
+// GET /api/service-settings/:service_type/:service_name
+router.get("/service-settings/:service_type/:service_name", async (req, res) => {
+    try {
+        const { service_type, service_name } = req.params;
+        
+        const [settings] = await pool.query(
+            `SELECT 
+                id,
+                service_type,
+                service_name,
+                setting_key,
+                setting_value,
+                setting_label,
+                setting_description,
+                data_type,
+                input_type,
+                is_encrypted,
+                is_required,
+                is_active,
+                sort_order,
+                category,
+                options,
+                validation_rules,
+                depends_on,
+                depends_value,
+                extra_config,
+                created_at,
+                updated_at
+            FROM system_service_settings 
+            WHERE service_type = ? AND service_name = ?
+            ORDER BY sort_order, category, setting_key`,
+            [service_type, service_name]
+        );
+        
+        if (settings.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: `Service configuration not found: ${service_type}/${service_name}`
+            });
+        }
+        
+        // Group settings by category for better organization
+        const groupedByCategory = {};
+        settings.forEach(setting => {
+            const category = setting.category || 'general';
+            if (!groupedByCategory[category]) {
+                groupedByCategory[category] = [];
+            }
+            
+            // Parse value based on data type
+            let parsedValue;
+            let displayValue;
+            
+            switch(setting.data_type) {
+                case 'boolean':
+                    parsedValue = ['true', '1', 'yes', 'on'].includes(setting.setting_value?.toString().toLowerCase());
+                    displayValue = parsedValue;
+                    break;
+                
+                case 'integer':
+                    parsedValue = parseInt(setting.setting_value) || 0;
+                    displayValue = parsedValue;
+                    break;
+                
+                case 'float':
+                    parsedValue = parseFloat(setting.setting_value) || 0;
+                    displayValue = parsedValue;
+                    break;
+                
+                case 'password':
+                case 'secret':
+                case 'api_key':
+                    parsedValue = setting.setting_value;
+                    displayValue = setting.setting_value ? '••••••••' : '';
+                    break;
+                
+                default:
+                    parsedValue = setting.setting_value;
+                    displayValue = setting.setting_value;
+            }
+            
+            // Parse options
+            let options = null;
+            if (setting.options) {
+                try {
+                    options = JSON.parse(setting.options);
+                } catch {
+                    options = [];
+                }
+            }
+            
+            groupedByCategory[category].push({
+                ...setting,
+                parsed_value: parsedValue,
+                display_value: displayValue,
+                options: options
+            });
+        });
+        
+        // Convert to array format
+        const categories = Object.keys(groupedByCategory).map(category => ({
+            category_name: category,
+            settings: groupedByCategory[category]
+        }));
+        
+        return res.json({
+            success: true,
+            service_type: service_type,
+            service_name: service_name,
+            categories: categories,
+            total_settings: settings.length
+        });
+        
+    } catch (err) {
+        console.error("Get service configuration error:", err);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch service configuration",
+            error: err.message
+        });
+    }
+});
+
+
+
+router.put("/service-settings/:service_type", async (req, res) => {
+    try {
+        const { service_type } = req.params;
+        const { config, is_active } = req.body;
+        
+        console.log(`Updating ${service_type}:`, { config, is_active });
+        
+        if (!config || typeof config !== 'object') {
+            return res.status(400).json({
+                success: false,
+                message: "Config object is required"
+            });
+        }
+        
+        // Check if service exists
+        const [existing] = await pool.query(
+            "SELECT id FROM system_service_settings WHERE service_type = ?",
+            [service_type]
+        );
+        
+        const configJson = JSON.stringify(config);
+        const activeStatus = is_active !== undefined ? is_active : false;
+        
+        if (existing.length > 0) {
+            // UPDATE
+            await pool.query(
+                `UPDATE system_service_settings 
+                 SET config_json = ?, 
+                     is_active = ?,
+                     updated_at = NOW()
+                 WHERE service_type = ?`,
+                [configJson, activeStatus, service_type]
+            );
+        } else {
+            // INSERT
+            // Get default service name
+            const serviceNames = {
+                'email': 'smtp',
+                'sms': 'twilio',
+                'payment': 'stripe',
+                'maps': 'google_maps',
+                'ai': 'openai'
+            };
+            const serviceName = serviceNames[service_type] || 'default';
+            
+            await pool.query(
+                `INSERT INTO system_service_settings 
+                 (service_type, service_name, config_json, is_active, created_at, updated_at) 
+                 VALUES (?, ?, ?, ?, NOW(), NOW())`,
+                [service_type, serviceName, configJson, activeStatus]
+            );
+        }
+        
+        return res.json({
+            success: true,
+            message: `${service_type} configuration saved successfully`,
+            service_type: service_type,
+            is_active: activeStatus
+        });
+        
+    } catch (err) {
+        console.error("Update service settings error:", err);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to update service settings",
+            error: err.message
+        });
+    }
+});
+
+// Helper function
+function getDefaultServiceName(serviceType) {
+    const defaults = {
+        'email': 'smtp',
+        'sms': 'twilio', 
+        'payment': 'stripe',
+        'maps': 'google_maps',
+        'ai': 'openai'
+    };
+    return defaults[serviceType] || 'default';
+}
+
+// GET /api/service-settings/:service_type
+router.get("/service-settings/:service_type", async (req, res) => {
+    try {
+        const { service_type } = req.params;
+        
+        const [settings] = await pool.query(
+            `SELECT 
+                id,
+                service_type,
+                service_name,
+                config_json,
+                is_active,
+                test_status,
+                test_message,
+                last_tested_at,
+                created_at,
+                updated_at
+            FROM system_service_settings 
+            WHERE service_type = ?`,
+            [service_type]
+        );
+        
+        if (settings.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: `Service configuration not found: ${service_type}`
+            });
+        }
+        
+        const setting = settings[0];
+        
+        // Parse JSON config
+        let configData = {};
+        try {
+            configData = JSON.parse(setting.config_json);
+        } catch (err) {
+            configData = {};
+        }
+        
+        // Create response object without config_json
+        const responseData = {
+            id: setting.id,
+            service_type: setting.service_type,
+            service_name: setting.service_name,
+            is_active: setting.is_active,
+            test_status: setting.test_status,
+            test_message: setting.test_message,
+            last_tested_at: setting.last_tested_at,
+            created_at: setting.created_at,
+            updated_at: setting.updated_at,
+            config: configData  // Only parsed config, no raw JSON string
+        };
+        
+        return res.json({
+            success: true,
+            data: responseData
+        });
+        
+    } catch (err) {
+        console.error("Get service settings error:", err);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch service settings",
+            error: err.message
+        });
+    }
+});
+
 module.exports = router;
