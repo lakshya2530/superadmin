@@ -136,6 +136,9 @@ const app = express();
 const HTTP_PORT = process.env.PORT || 3000;
 const HTTPS_PORT = process.env.HTTPS_PORT || 3001;
 
+
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
 // Enable CORS
 app.use(cors({
   origin: ["http://localhost:5173","http://localhost:3010","https://dodgerblue-lyrebird-351186.hostingersite.com", "https://72.61.232.245"],
