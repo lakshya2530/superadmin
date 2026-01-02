@@ -48,54 +48,141 @@ async function calculatePlanStatistics(conn) {
 }
 
 // Format plan data with features
+// async function formatPlanWithFeatures(conn, plan) {
+//     try {
+//         // Get plan features
+//         const [features] = await conn.query(`
+//             SELECT 
+//                 feature_key,
+//                 feature_name,
+//                 is_enabled
+//             FROM plan_features
+//             WHERE plan_id = ?
+//             ORDER BY sort_order
+//         `, [plan.id]);
+
+//         // Get active tenants count for this plan
+//         const [tenantStats] = await conn.query(`
+//             SELECT 
+//                 COUNT(*) as active_tenants,
+//                 COALESCE(SUM(
+//                     CASE 
+//                         WHEN plan = ? THEN monthly_price
+//                         ELSE 0
+//                     END
+//                 ), 0) as plan_revenue
+//             FROM tenants
+//             WHERE status = 'active' AND plan = ?
+//         `, [plan.plan_name, plan.plan_name]);
+
+//         return {
+//             ...plan,
+//             features: features.reduce((acc, feature) => {
+//                 acc[feature.feature_key] = {
+//                     name: feature.feature_name,
+//                     enabled: feature.is_enabled === 1
+//                 };
+//                 return acc;
+//             }, {}),
+//             active_tenants: parseInt(tenantStats[0]?.active_tenants || 0),
+//             plan_revenue: parseFloat(tenantStats[0]?.plan_revenue || 0),
+//             formatted_monthly_price: `SAR ${plan.monthly_price.toFixed(2)}`,
+//             formatted_yearly_price: `SAR ${plan.yearly_price.toFixed(2)}`,
+//             formatted_plan_revenue: `SAR ${parseFloat(tenantStats[0]?.plan_revenue || 0).toFixed(2)}`
+//         };
+//     } catch (err) {
+//         console.error("Format plan error:", err);
+//         return plan;
+//     }
+// }
 async function formatPlanWithFeatures(conn, plan) {
     try {
-        // Get plan features
+        // Get all features for this plan
         const [features] = await conn.query(`
-            SELECT 
-                feature_key,
-                feature_name,
-                is_enabled
-            FROM plan_features
-            WHERE plan_id = ?
-            ORDER BY sort_order
+            SELECT * FROM plan_features 
+            WHERE plan_id = ? 
+            ORDER BY sort_order ASC
         `, [plan.id]);
 
-        // Get active tenants count for this plan
-        const [tenantStats] = await conn.query(`
+        // Calculate monthly and yearly revenue
+        // Assuming you have a tenants table with plan_name and subscription_interval
+        const [revenueData] = await conn.query(`
             SELECT 
-                COUNT(*) as active_tenants,
-                COALESCE(SUM(
-                    CASE 
-                        WHEN plan = ? THEN monthly_price
-                        ELSE 0
-                    END
-                ), 0) as plan_revenue
-            FROM tenants
-            WHERE status = 'active' AND plan = ?
-        `, [plan.plan_name, plan.plan_name]);
+                SUM(CASE WHEN t.subscription_interval = 'monthly' THEN 1 ELSE 0 END) as monthly_subscribers,
+                SUM(CASE WHEN t.subscription_interval = 'yearly' THEN 1 ELSE 0 END) as yearly_subscribers
+            FROM tenants t 
+            WHERE t.plan = ? AND t.status = 'active'
+        `, [plan.plan_name]);
+
+        const monthlyRevenue = (revenueData[0]?.monthly_subscribers || 0) * plan.monthly_price;
+        const yearlyRevenue = (revenueData[0]?.yearly_subscribers || 0) * plan.yearly_price;
+        const totalRevenue = monthlyRevenue + yearlyRevenue;
+
+        // Format features into object
+        const formattedFeatures = {};
+        features.forEach(feature => {
+            formattedFeatures[feature.feature_key] = {
+                id: feature.id,
+                name: feature.feature_name,
+                enabled: feature.is_enabled === 1,
+                sort_order: feature.sort_order,
+                created_at: feature.created_at,
+                updated_at: feature.updated_at
+            };
+        });
 
         return {
-            ...plan,
-            features: features.reduce((acc, feature) => {
-                acc[feature.feature_key] = {
-                    name: feature.feature_name,
-                    enabled: feature.is_enabled === 1
-                };
-                return acc;
-            }, {}),
-            active_tenants: parseInt(tenantStats[0]?.active_tenants || 0),
-            plan_revenue: parseFloat(tenantStats[0]?.plan_revenue || 0),
-            formatted_monthly_price: `SAR ${plan.monthly_price.toFixed(2)}`,
-            formatted_yearly_price: `SAR ${plan.yearly_price.toFixed(2)}`,
-            formatted_plan_revenue: `SAR ${parseFloat(tenantStats[0]?.plan_revenue || 0).toFixed(2)}`
+            id: plan.id,
+            plan_id: plan.plan_id,
+            plan_name: plan.plan_name,
+            description: plan.description,
+            monthly_price: plan.monthly_price,
+            yearly_price: plan.yearly_price,
+            max_users: plan.max_users,
+            max_customers: plan.max_customers,
+            max_visits: plan.max_visits,
+            max_storage_gb: plan.max_storage_gb,
+            status: plan.status,
+            sort_order: plan.sort_order,
+            is_default: plan.is_default,
+            created_at: plan.created_at,
+            updated_at: plan.updated_at,
+            
+            // All features as object
+            features: formattedFeatures,
+            
+            // Additional calculated fields
+            active_tenants: plan.active_tenants || 0,
+            enabled_features_count: plan.enabled_features_count || 0,
+            
+            // Revenue data
+            revenue: {
+                monthly: monthlyRevenue,
+                yearly: yearlyRevenue,
+                total: totalRevenue,
+                monthly_subscribers: revenueData[0]?.monthly_subscribers || 0,
+                yearly_subscribers: revenueData[0]?.yearly_subscribers || 0,
+                total_subscribers: (revenueData[0]?.monthly_subscribers || 0) + 
+                                 (revenueData[0]?.yearly_subscribers || 0)
+            }
         };
     } catch (err) {
-        console.error("Format plan error:", err);
-        return plan;
+        console.error("Error formatting plan:", err);
+        // Return plan without features if there's an error
+        return {
+            ...plan,
+            features: {},
+            revenue: {
+                monthly: 0,
+                yearly: 0,
+                total: 0,
+                monthly_subscribers: 0,
+                yearly_subscribers: 0,
+                total_subscribers: 0
+            }
+        };
     }
 }
-
 // ==================== SUBSCRIPTION PLANS API ====================
 
 // 1. Get all plans with filters
@@ -143,7 +230,7 @@ router.get("/", async (req, res) => {
 
         const [rows] = await conn.query(query, params);
         
-        // Format each plan with features
+        // Format each plan with features and revenue
         const formattedPlans = [];
         for (const plan of rows) {
             const formattedPlan = await formatPlanWithFeatures(conn, plan);
@@ -180,8 +267,12 @@ router.get("/:id", async (req, res) => {
         const conn = await pool.getConnection();
 
         const [rows] = await conn.query(`
-            SELECT * FROM subscription_plans 
-            WHERE id = ? OR plan_id = ? OR plan_name LIKE ?
+            SELECT 
+                sp.*,
+                (SELECT COUNT(*) FROM tenants t WHERE t.plan = sp.plan_name AND t.status = 'active') as active_tenants,
+                (SELECT COUNT(*) FROM plan_features pf WHERE pf.plan_id = sp.id AND pf.is_enabled = 1) as enabled_features_count
+            FROM subscription_plans sp
+            WHERE sp.id = ? OR sp.plan_id = ? OR sp.plan_name LIKE ?
         `, [planId, planId, `%${planId}%`]);
 
         if (rows.length === 0) {
@@ -211,7 +302,6 @@ router.get("/:id", async (req, res) => {
         });
     }
 });
-
 // 3. Create new plan
 router.post("/", async (req, res) => {
     let conn;

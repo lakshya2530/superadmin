@@ -2,7 +2,9 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../../db/connection.js");
 const { v4: uuidv4 } = require('uuid');
-
+const { upload, uploadFiles } = require('./multerConfig');
+const fs = require('fs'); // Add this line
+const path = require('path'); 
 // Helper function to generate Ticket ID
 function generateTicketId() {
     const timestamp = Date.now().toString(36);
@@ -208,27 +210,45 @@ router.get("/:id", async (req, res) => {
             });
         }
 
-        // Get ticket conversations
+        // Get all ticket conversations
         const [conversationRows] = await conn.query(
             'SELECT * FROM ticket_conversations WHERE ticket_id = ? ORDER BY created_at ASC',
             [ticketRows[0].ticket_id]
         );
 
         const ticket = ticketRows[0];
+        
+        // Format ticket data
         ticket.formatted_created_at = formatDate(ticket.created_at);
         ticket.formatted_updated_at = formatDate(ticket.updated_at);
         ticket.attachments = parseJSON(ticket.attachments);
+        
+        // Format conversations array
         ticket.conversations = conversationRows.map(conv => ({
-            ...conv,
+            id: conv.id,
+            ticket_id: conv.ticket_id,
+            message: conv.message,
+            sender_name: conv.sender_name,
+            sender_email: conv.sender_email,
+            sender_type: conv.sender_type,
+            attachments: parseJSON(conv.attachments) || [], // Ensure it's always an array
+            created_at: conv.created_at,
             formatted_created_at: formatDate(conv.created_at),
-            attachments: parseJSON(conv.attachments)
+            // Add full URLs for attachments
+            attachments_with_urls: (parseJSON(conv.attachments) || []).map(attachment => ({
+                ...attachment,
+                full_url: `${req.protocol}://${req.get('host')}${attachment.url}`
+            }))
         }));
 
         conn.release();
 
         return res.json({
             success: true,
-            data: ticket
+            data: {
+                ...ticket,
+                total_replies: ticket.conversations.length
+            }
         });
 
     } catch (err) {
@@ -240,7 +260,6 @@ router.get("/:id", async (req, res) => {
         });
     }
 });
-
 // Create new ticket
 router.post("/", async (req, res) => {
     try {
@@ -521,25 +540,32 @@ router.patch("/:id/assign", async (req, res) => {
 });
 
 // Add reply to ticket
-router.post("/:id/reply", async (req, res) => {
+router.post("/:id/reply", upload.array('attachments', 10), async (req, res) => {
+    const conn = await pool.getConnection();
+    
     try {
         const ticketId = req.params.id;
+        
+        // Parse form data fields
         const {
             message,
             sender_name,
             sender_email,
-            sender_type = 'admin',
-            attachments = []
+            sender_type = 'admin'
         } = req.body;
 
         if (!message || !sender_name || !sender_email) {
+            // Clean up uploaded files if validation fails
+            if (req.files && req.files.length > 0) {
+                req.files.forEach(file => {
+                    fs.unlinkSync(file.path);
+                });
+            }
             return res.status(400).json({
                 success: false,
                 message: "Message, sender name, and sender email are required"
             });
         }
-
-        const conn = await pool.getConnection();
 
         // Check if ticket exists
         const [checkResult] = await conn.query(
@@ -548,10 +574,30 @@ router.post("/:id/reply", async (req, res) => {
         );
 
         if (checkResult.length === 0) {
+            // Clean up uploaded files if ticket not found
+            if (req.files && req.files.length > 0) {
+                req.files.forEach(file => {
+                    fs.unlinkSync(file.path);
+                });
+            }
             conn.release();
             return res.status(404).json({
                 success: false,
                 message: "Ticket not found"
+            });
+        }
+
+        // Process uploaded files
+        const attachments = [];
+        if (req.files && req.files.length > 0) {
+            req.files.forEach(file => {
+                attachments.push({
+                    filename: file.originalname,
+                    path: file.path.replace(/\\/g, '/'), // Replace backslashes for cross-platform
+                    mimetype: file.mimetype,
+                    size: file.size,
+                    url: `/uploads/tickets/${path.basename(file.path)}` // URL to access the file
+                });
             });
         }
 
@@ -574,9 +620,9 @@ router.post("/:id/reply", async (req, res) => {
             JSON.stringify(attachments)
         ]);
 
-        // Update reply count
+        // Update reply count and last updated time
         await conn.query(
-            'UPDATE support_tickets SET reply_count = reply_count + 1 WHERE id = ?',
+            'UPDATE support_tickets SET reply_count = reply_count + 1, updated_at = NOW() WHERE id = ?',
             [checkResult[0].id]
         );
 
@@ -588,11 +634,22 @@ router.post("/:id/reply", async (req, res) => {
             data: {
                 ticket_id: checkResult[0].ticket_id,
                 reply_id: convResult.insertId,
-                reply_count: checkResult[0].reply_count + 1
+                reply_count: checkResult[0].reply_count + 1,
+                attachments: attachments
             }
         });
 
     } catch (err) {
+        // Clean up uploaded files on error
+        if (req.files && req.files.length > 0) {
+            req.files.forEach(file => {
+                if (fs.existsSync(file.path)) {
+                    fs.unlinkSync(file.path);
+                }
+            });
+        }
+        
+        conn.release();
         console.error("Add reply error:", err);
         return res.status(500).json({
             success: false,
@@ -601,7 +658,6 @@ router.post("/:id/reply", async (req, res) => {
         });
     }
 });
-
 // Bulk update ticket status
 router.patch("/bulk/list/status", async (req, res) => {
     try {

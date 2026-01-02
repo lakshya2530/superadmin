@@ -1063,12 +1063,20 @@ router.put("api-key/:id", async (req, res) => {
 });
 
 // DELETE - Revoke API key
-router.delete("api-key/:id", async (req, res) => {
+router.delete("/api-key/delete/:id", async (req, res) => {
+    let conn;
     try {
         const keyId = req.params.id;
-        const { reason } = req.body;
         
-        const conn = await pool.getConnection();
+        // Validate ID
+        if (!keyId || isNaN(keyId)) {
+            return res.status(400).json({
+                success: false,
+                message: "Valid API key ID is required"
+            });
+        }
+        
+        conn = await pool.getConnection();
         
         // Check if key exists
         const [checkRows] = await conn.query(
@@ -1084,29 +1092,29 @@ router.delete("api-key/:id", async (req, res) => {
             });
         }
         
-        // Soft delete - set inactive
+        // Hard delete - permanently remove the record
         await conn.query(
-            "UPDATE api_keys SET is_active = false, revoked_at = NOW(), revoke_reason = ?, updated_at = NOW() WHERE id = ?",
-            [reason || "Revoked by admin", keyId]
+            "DELETE FROM api_keys WHERE id = ?",
+            [keyId]
         );
         
         conn.release();
         
         return res.json({
             success: true,
-            message: "API key revoked successfully"
+            message: "API key deleted successfully"
         });
         
     } catch (err) {
-        console.error("API key revocation error:", err);
+        console.error("API key deletion error:", err);
+        if (conn) conn.release();
         return res.status(500).json({
             success: false,
-            message: "Failed to revoke API key",
+            message: "Failed to delete API key",
             error: err.message
         });
     }
 });
-
 
 router.get("/api-key/list", async (req, res) => {
     try {
@@ -1453,12 +1461,20 @@ router.put("webhook/:id", async (req, res) => {
 });
 
 // DELETE - Remove webhook
-router.delete("webhook/:id", async (req, res) => {
+router.delete("/webhook/:id", async (req, res) => {
+    let conn;
     try {
         const webhookId = req.params.id;
-        const { reason } = req.body;
         
-        const conn = await pool.getConnection();
+        // Validate ID
+        if (!webhookId || isNaN(webhookId)) {
+            return res.status(400).json({
+                success: false,
+                message: "Valid webhook ID is required"
+            });
+        }
+        
+        conn = await pool.getConnection();
         
         // Check if webhook exists
         const [checkRows] = await conn.query(
@@ -1474,29 +1490,29 @@ router.delete("webhook/:id", async (req, res) => {
             });
         }
         
-        // Soft delete - set inactive
+        // Hard delete - permanently remove
         await conn.query(
-            "UPDATE webhooks SET is_active = false, description = CONCAT(COALESCE(description, ''), ' [Deleted: ', ?, ']'), updated_at = NOW() WHERE id = ?",
-            [reason || "Removed by admin", webhookId]
+            "DELETE FROM webhooks WHERE id = ?",
+            [webhookId]
         );
         
         conn.release();
         
         return res.json({
             success: true,
-            message: "Webhook removed successfully"
+            message: "Webhook deleted successfully"
         });
         
     } catch (err) {
         console.error("Webhook deletion error:", err);
+        if (conn) conn.release();
         return res.status(500).json({
             success: false,
-            message: "Failed to remove webhook",
+            message: "Failed to delete webhook",
             error: err.message
         });
     }
 });
-
 // POST - Test webhook delivery
 router.post("webhook/:id/test", async (req, res) => {
     try {

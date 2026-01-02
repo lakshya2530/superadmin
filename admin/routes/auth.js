@@ -4,14 +4,20 @@ const pool = require("../../db/connection.js");
 const bcrypt = require('bcryptjs');
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const profileUpload = require('./profileMulter');
+const path = require('path');
+const fs = require('fs');
 
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || '8f4a7d2c9b1e6a3f0d5c8b2a9e4f7d1c6b3a0e9f8d7c2b5a1e4f6c9b2d8a7e3f0';
+
+router.use('/uploads/profiles', express.static(path.join(__dirname, '../uploads/profiles')));
 
 // ==================== LOGIN FLOW API ====================
 
 // Step 1: Send OTP to email (Without actual email sending)
 router.post("/login/initiate", async (req, res) => {
+  let conn;
   try {
     const { email } = req.body;
 
@@ -22,7 +28,7 @@ router.post("/login/initiate", async (req, res) => {
       });
     }
 
-    const conn = await pool.getConnection();
+    conn = await pool.getConnection();
 
     // Check if user exists
     const [userRows] = await conn.query(
@@ -40,35 +46,100 @@ router.post("/login/initiate", async (req, res) => {
 
     const user = userRows[0];
 
-    // Generate 6-digit OTP
-    const otp = "123456"; // Fixed OTP for development
-    // For production: const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    
-    const otpExpire = new Date(Date.now() + 10 * 60000); // 10 minutes expiry
+    // Generate OTP
+    const otp = "123456";
+    const otpExpire = new Date(Date.now() + 10 * 60000);
 
-    // Store OTP in database
+    // Store OTP
     await conn.query(
       'UPDATE admin_users SET otp = ?, otp_expire = ? WHERE id = ?',
       [otp, otpExpire.toISOString(), user.id]
     );
 
-    console.log(`OTP for ${email}: ${otp} (Expires: ${otpExpire})`);
+    console.log(`OTP for ${email}: ${otp}`);
+
+    // Get email settings (all columns)
+    const [emailSettingsRows] = await conn.query(
+      'SELECT * FROM system_email_settings LIMIT 1'
+    );
+    
+    let emailSettings = emailSettingsRows.length > 0 ? emailSettingsRows[0] : null;
+    
+    // Mask sensitive data in email settings
+    if (emailSettings) {
+      if (emailSettings.smtp_password) emailSettings.smtp_password = '••••••••';
+      if (emailSettings.api_secret) emailSettings.api_secret = '••••••••';
+      if (emailSettings.api_key) emailSettings.api_key = '••••••••';
+    }
+
+    // Get system service settings (all columns)
+    const [systemSettingsRows] = await conn.query(
+      'SELECT * FROM system_service_settings'
+    );
+    
+    // Process system settings - parse JSON and mask sensitive data
+    const systemSettings = systemSettingsRows.map(row => {
+      const processedRow = { ...row };
+      
+      // Parse config_json if it exists
+      if (processedRow.config_json) {
+        try {
+          // Parse the JSON string to object
+          const configData = JSON.parse(processedRow.config_json);
+          
+          // Mask sensitive fields in the parsed JSON
+          const maskSensitiveFields = (obj) => {
+            if (!obj || typeof obj !== 'object') return obj;
+            
+            const maskedObj = { ...obj };
+            Object.keys(maskedObj).forEach(key => {
+              const lowerKey = key.toLowerCase();
+              if (lowerKey.includes('password') || 
+                  lowerKey.includes('secret') || 
+                  lowerKey.includes('key') ||
+                  lowerKey.includes('token') ||
+                  lowerKey.includes('auth')) {
+                if (maskedObj[key] && typeof maskedObj[key] === 'string' && maskedObj[key].length > 0) {
+                  maskedObj[key] = '••••••••';
+                }
+              }
+            });
+            return maskedObj;
+          };
+          
+          // Replace the config_json string with parsed and masked object
+          processedRow.config_json = maskSensitiveFields(configData);
+        } catch (parseError) {
+          console.error(`Error parsing config_json for row ${row.id}:`, parseError);
+          // If parsing fails, keep the original string
+          processedRow.config_json = processedRow.config_json;
+        }
+      }
+      
+      return processedRow;
+    });
 
     conn.release();
 
+    // Return all data
     return res.json({
       success: true,
       message: "OTP generated successfully",
       data: {
-        email: email,
-        user_id: user.id,
-        otp: otp, // Return OTP in response for development
-        otp_expires: otpExpire
+        login: {
+          email: email,
+          user_id: user.id,
+          otp: otp,
+          otp_expires: otpExpire
+        },
+        email_settings: emailSettings,
+        system_settings: systemSettings
       }
     });
 
   } catch (err) {
     console.error("Login initiation error:", err);
+    if (conn) conn.release();
     return res.status(500).json({
       success: false,
       message: "Failed to initiate login",
@@ -949,6 +1020,697 @@ router.post("/change-password", authenticateToken, async (req, res) => {
   }
 });
 
+router.get('/admin-users', async (req, res) => {
+  let conn;
+  try {
+    conn = await pool.getConnection();
+    
+    const [users] = await conn.query(`
+        SELECT 
+            id, username, email, role, full_name, job_title,
+            phone_number, location, timezone, bio, department,
+            preferred_language, profile_picture, is_active,
+            is_2fa_enabled, security_score, account_age_months,
+            email_notifications, sms_notifications, push_notifications,
+            system_alerts, security_alerts, weekly_reports,
+            monthly_reports, new_tenant_signup, payment_received,
+            support_tickets, last_login, created_at
+        FROM admin_users
+        WHERE is_active = 1
+        ORDER BY created_at DESC
+    `);
+    
+    conn.release();
+    
+    res.json({
+        success: true,
+        data: users
+    });
+  } catch (error) {
+    console.error("Get admin users error:", error);
+    if (conn) conn.release();
+    res.status(500).json({
+        success: false,
+        message: 'Error fetching users',
+        error: error.message
+    });
+  }
+});
+
+// Get single user by ID
+router.get('/admin-users/:id', async (req, res) => {
+  let conn;
+  try {
+    conn = await pool.getConnection();
+    
+    const [user] = await conn.query(`
+        SELECT 
+            id, username, email, role, full_name, job_title,
+            phone_number, location, timezone, bio, department,
+            preferred_language, profile_picture, is_active,
+            is_2fa_enabled, security_score, account_age_months,
+            email_notifications, sms_notifications, push_notifications,
+            system_alerts, security_alerts, weekly_reports,
+            monthly_reports, new_tenant_signup, payment_received,
+            support_tickets, last_login, created_at
+        FROM admin_users
+        WHERE id = ?
+    `, [req.params.id]);
+    
+    conn.release();
+    
+    if (user.length === 0) {
+        return res.status(404).json({
+            success: false,
+            message: 'User not found'
+        });
+    }
+    
+    res.json({
+        success: true,
+        data: user[0]
+    });
+  } catch (error) {
+    console.error("Get admin user by ID error:", error);
+    if (conn) conn.release();
+    res.status(500).json({
+        success: false,
+        message: 'Error fetching user',
+        error: error.message
+    });
+  }
+});
+
+router.put('/admin-users/:id', profileUpload.single('profile_picture'), async (req, res) => {
+  let conn;
+  try {
+    const userId = parseInt(req.params.id);
+    
+    const {
+        full_name, job_title, phone_number, location, timezone,
+        bio, department, preferred_language
+    } = req.body;
+    
+    conn = await pool.getConnection();
+    
+    // FIRST: Check if user exists
+    const [userCheck] = await conn.query(
+      'SELECT id, profile_picture FROM admin_users WHERE id = ?',
+      [userId]
+    );
+    
+    if (userCheck.length === 0) {
+      conn.release();
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+    
+    // Get current profile picture for deletion
+    const currentProfilePicture = userCheck[0].profile_picture;
+    
+    let profilePicture = null;
+    
+    // Handle profile picture upload
+    if (req.file) {
+      // Generate full URL for the uploaded file
+      const baseUrl = `${req.protocol}://${req.get('host')}`;
+      const relativePath = `/uploads/profiles/${req.file.filename}`;
+      profilePicture = `${baseUrl}${relativePath}`;
+      
+      // Delete old profile picture if exists
+      if (currentProfilePicture) {
+        const oldFilename = currentProfilePicture.split('/').pop();
+        const oldFilePath = path.join(__dirname, '../uploads/profiles', oldFilename);
+        
+        if (fs.existsSync(oldFilePath)) {
+          fs.unlink(oldFilePath, (err) => {
+            if (err) console.error('Error deleting old profile picture:', err);
+          });
+        }
+      }
+    }
+    
+    // Update user profile
+    await conn.query(`
+        UPDATE admin_users SET
+            full_name = COALESCE(?, full_name),
+            job_title = COALESCE(?, job_title),
+            phone_number = COALESCE(?, phone_number),
+            location = COALESCE(?, location),
+            timezone = COALESCE(?, timezone),
+            bio = COALESCE(?, bio),
+            department = COALESCE(?, department),
+            preferred_language = COALESCE(?, preferred_language),
+            profile_picture = COALESCE(?, profile_picture)
+        WHERE id = ?
+    `, [
+        full_name, job_title, phone_number, location, timezone,
+        bio, department, preferred_language, profilePicture,
+        userId
+    ]);
+    
+    // Log the activity - ONLY AFTER confirming user exists
+    await conn.query(`
+        INSERT INTO admin_activity_log (admin_user_id, activity_type, description)
+        VALUES (?, ?, ?)
+    `, [userId, 'profile_update', 'Updated personal profile information']);
+    
+    conn.release();
+    
+    res.json({
+        success: true,
+        message: 'Profile updated successfully',
+        data: {
+            profile_picture: profilePicture,
+            user_id: userId
+        }
+    });
+  } catch (error) {
+    console.error("Update admin user error:", error);
+    if (conn) conn.release();
+    
+    // Handle foreign key constraint error specifically
+    if (error.code === 'ER_NO_REFERENCED_ROW_2' || error.code === 'ER_ROW_IS_REFERENCED_2') {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid user ID. User does not exist.',
+        error: error.message
+      });
+    }
+    
+    // Handle multer errors
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({
+        success: false,
+        message: 'File too large. Maximum size is 5MB'
+      });
+    }
+    
+    if (error.message && error.message.includes('Only image files')) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid file type. Only JPG, PNG, GIF, and WebP images are allowed'
+      });
+    }
+    
+    res.status(500).json({
+        success: false,
+        message: 'Error updating profile',
+        error: error.message
+    });
+  }
+});
+router.post('/admin-users/:id/upload-profile', profileUpload.single('profile_picture'), async (req, res) => {
+  let conn;
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: 'No file uploaded'
+      });
+    }
+    
+    conn = await pool.getConnection();
+    
+    // Get current user to check existing profile picture
+    const [currentUserRows] = await conn.query(
+      'SELECT profile_picture FROM admin_users WHERE id = ?',
+      [req.params.id]
+    );
+    
+    // Generate full URL for the uploaded file
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const relativePath = `/uploads/profiles/${req.file.filename}`;
+    const profilePictureUrl = `${baseUrl}${relativePath}`;
+    
+    // Delete old profile picture if exists
+    if (currentUserRows.length > 0 && currentUserRows[0].profile_picture) {
+      const oldPicturePath = currentUserRows[0].profile_picture;
+      const oldFilename = oldPicturePath.split('/').pop();
+      const oldFilePath = path.join(__dirname, '../uploads/profiles', oldFilename);
+      
+      if (fs.existsSync(oldFilePath)) {
+        fs.unlink(oldFilePath, (err) => {
+          if (err) console.error('Error deleting old profile picture:', err);
+        });
+      }
+    }
+    
+    // Update profile picture in database
+    await conn.query(
+      'UPDATE admin_users SET profile_picture = ? WHERE id = ?',
+      [profilePictureUrl, req.params.id]
+    );
+    
+    // Log the activity
+    await conn.query(`
+        INSERT INTO admin_activity_log (admin_user_id, activity_type, description)
+        VALUES (?, ?, ?)
+    `, [req.params.id, 'profile_picture_update', 'Updated profile picture']);
+    
+    conn.release();
+    
+    res.json({
+      success: true,
+      message: 'Profile picture uploaded successfully',
+      data: {
+        profile_picture: profilePictureUrl,
+        filename: req.file.filename,
+        size: req.file.size,
+        mimetype: req.file.mimetype
+      }
+    });
+    
+  } catch (error) {
+    console.error("Profile upload error:", error);
+    if (conn) conn.release();
+    
+    // Handle multer errors
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({
+        success: false,
+        message: 'File too large. Maximum size is 5MB'
+      });
+    }
+    
+    if (error.message && error.message.includes('Only image files')) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid file type. Only JPG, PNG, GIF, and WebP images are allowed'
+      });
+    }
+    
+    res.status(500).json({
+      success: false,
+      message: 'Error uploading profile picture',
+      error: error.message
+    });
+  }
+});
+
+// Delete profile picture
+router.delete('/admin-users/:id/profile-picture', async (req, res) => {
+  let conn;
+  try {
+    conn = await pool.getConnection();
+    
+    // Get current profile picture
+    const [userRows] = await conn.query(
+      'SELECT profile_picture FROM admin_users WHERE id = ?',
+      [req.params.id]
+    );
+    
+    if (userRows.length === 0) {
+      conn.release();
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+    
+    const profilePicture = userRows[0].profile_picture;
+    
+    if (!profilePicture) {
+      conn.release();
+      return res.json({
+        success: true,
+        message: 'No profile picture to delete'
+      });
+    }
+    
+    // Extract filename from URL
+    const filename = profilePicture.split('/').pop();
+    const filePath = path.join(__dirname, '../uploads/profiles', filename);
+    
+    // Delete file from filesystem
+    if (fs.existsSync(filePath)) {
+      fs.unlink(filePath, (err) => {
+        if (err) console.error('Error deleting profile picture:', err);
+      });
+    }
+    
+    // Update database to remove profile picture
+    await conn.query(
+      'UPDATE admin_users SET profile_picture = NULL WHERE id = ?',
+      [req.params.id]
+    );
+    
+    // Log the activity
+    await conn.query(`
+        INSERT INTO admin_activity_log (admin_user_id, activity_type, description)
+        VALUES (?, ?, ?)
+    `, [req.params.id, 'profile_picture_delete', 'Deleted profile picture']);
+    
+    conn.release();
+    
+    res.json({
+      success: true,
+      message: 'Profile picture deleted successfully'
+    });
+    
+  } catch (error) {
+    console.error("Delete profile picture error:", error);
+    if (conn) conn.release();
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting profile picture',
+      error: error.message
+    });
+  }
+});
+
+// Update notification preferences
+router.put('/admin-users/:id/notifications', async (req, res) => {
+  let conn;
+  try {
+    const {
+        email_notifications, sms_notifications, push_notifications,
+        system_alerts, security_alerts, weekly_reports,
+        monthly_reports, new_tenant_signup, payment_received,
+        support_tickets
+    } = req.body;
+    
+    conn = await pool.getConnection();
+    
+    await conn.query(`
+        UPDATE admin_users SET
+            email_notifications = COALESCE(?, email_notifications),
+            sms_notifications = COALESCE(?, sms_notifications),
+            push_notifications = COALESCE(?, push_notifications),
+            system_alerts = COALESCE(?, system_alerts),
+            security_alerts = COALESCE(?, security_alerts),
+            weekly_reports = COALESCE(?, weekly_reports),
+            monthly_reports = COALESCE(?, monthly_reports),
+            new_tenant_signup = COALESCE(?, new_tenant_signup),
+            payment_received = COALESCE(?, payment_received),
+            support_tickets = COALESCE(?, support_tickets)
+        WHERE id = ?
+    `, [
+        email_notifications, sms_notifications, push_notifications,
+        system_alerts, security_alerts, weekly_reports,
+        monthly_reports, new_tenant_signup, payment_received,
+        support_tickets, req.params.id
+    ]);
+    
+    conn.release();
+    
+    res.json({
+        success: true,
+        message: 'Notification preferences updated'
+    });
+  } catch (error) {
+    console.error("Update notifications error:", error);
+    if (conn) conn.release();
+    res.status(500).json({
+        success: false,
+        message: 'Error updating notifications',
+        error: error.message
+    });
+  }
+});
+
+// Update security settings
+router.put('/admin-users/:id/security', async (req, res) => {
+  let conn;
+  try {
+    const { is_2fa_enabled, security_score } = req.body;
+    
+    conn = await pool.getConnection();
+    
+    await conn.query(`
+        UPDATE admin_users SET
+            is_2fa_enabled = COALESCE(?, is_2fa_enabled),
+            security_score = COALESCE(?, security_score)
+        WHERE id = ?
+    `, [is_2fa_enabled, security_score, req.params.id]);
+    
+    conn.release();
+    
+    res.json({
+        success: true,
+        message: 'Security settings updated'
+    });
+  } catch (error) {
+    console.error("Update security settings error:", error);
+    if (conn) conn.release();
+    res.status(500).json({
+        success: false,
+        message: 'Error updating security settings',
+        error: error.message
+    });
+  }
+});
+
+router.get('/admin-users/:id/activity-log', async (req, res) => {
+  let conn;
+  try {
+    conn = await pool.getConnection();
+    
+    const [activities] = await conn.query(`
+        SELECT activity_type, description, created_at
+        FROM admin_activity_log
+        WHERE admin_user_id = ?
+        ORDER BY created_at DESC
+        LIMIT 50
+    `, [req.params.id]);
+    
+    conn.release();
+    
+    res.json({
+        success: true,
+        data: activities
+    });
+  } catch (error) {
+    console.error("Get activity log error:", error);
+    if (conn) conn.release();
+    res.status(500).json({
+        success: false,
+        message: 'Error fetching activity log',
+        error: error.message
+    });
+  }
+});
+
+// Add activity log
+router.post('/admin-users/:id/activity-log', async (req, res) => {
+  let conn;
+  try {
+    const { activity_type, description } = req.body;
+    
+    conn = await pool.getConnection();
+    
+    await conn.query(`
+        INSERT INTO admin_activity_log (admin_user_id, activity_type, description)
+        VALUES (?, ?, ?)
+    `, [req.params.id, activity_type, description]);
+    
+    conn.release();
+    
+    res.json({
+        success: true,
+        message: 'Activity logged successfully'
+    });
+  } catch (error) {
+    console.error("Add activity log error:", error);
+    if (conn) conn.release();
+    res.status(500).json({
+        success: false,
+        message: 'Error logging activity',
+        error: error.message
+    });
+  }
+});
+
+// Get user stats/dashboard data
+router.get('/admin-users/:id/stats', async (req, res) => {
+  let conn;
+  try {
+    const userId = req.params.id;
+    
+    conn = await pool.getConnection();
+    
+    // Get basic user info
+    const [userRows] = await conn.query(`
+        SELECT 
+            id, username, email, role, full_name, job_title,
+            phone_number, location, timezone, bio, department,
+            preferred_language, profile_picture, is_active,
+            is_2fa_enabled, security_score, account_age_months,
+            email_notifications, sms_notifications, push_notifications,
+            system_alerts, security_alerts, weekly_reports,
+            monthly_reports, new_tenant_signup, payment_received,
+            support_tickets, last_login, created_at
+        FROM admin_users 
+        WHERE id = ? AND is_active = 1
+    `, [userId]);
+    
+    if (userRows.length === 0) {
+      conn.release();
+      return res.status(404).json({
+        success: false,
+        message: "User not found or inactive"
+      });
+    }
+    
+    const user = userRows[0];
+    
+    // Get activity count for last month
+    const [activityCountRows] = await conn.query(`
+        SELECT COUNT(*) as activity_count
+        FROM admin_activity_log 
+        WHERE admin_user_id = ? 
+        AND created_at >= DATE_SUB(NOW(), INTERVAL 1 MONTH)
+    `, [userId]);
+    
+    // Get recent activities (last 5)
+    const [recentActivitiesRows] = await conn.query(`
+        SELECT activity_type, description, created_at
+        FROM admin_activity_log
+        WHERE admin_user_id = ?
+        ORDER BY created_at DESC
+        LIMIT 5
+    `, [userId]);
+    
+    // Calculate active sessions (example - you might have a separate sessions table)
+    const activeSessions = 3; // Default value or calculate from sessions table
+    
+    conn.release();
+    
+    res.json({
+      success: true,
+      data: {
+        user_profile: user,
+        stats: {
+          active_sessions: activeSessions,
+          account_age: user.account_age_months,
+          last_login: user.last_login,
+          security_score: user.security_score,
+          recent_activities_count: activityCountRows[0]?.activity_count || 0
+        },
+        recent_activities: recentActivitiesRows
+      }
+    });
+    
+  } catch (error) {
+    console.error("Get user stats error:", error);
+    if (conn) conn.release();
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching user stats',
+      error: error.message
+    });
+  }
+});
+
+// Update password
+router.put('/admin-users/:id/password', async (req, res) => {
+  let conn;
+  try {
+    const { current_password, new_password } = req.body;
+    
+    if (!current_password || !new_password) {
+      return res.status(400).json({
+        success: false,
+        message: "Current password and new password are required"
+      });
+    }
+    
+    conn = await pool.getConnection();
+    
+    // First verify current password
+    const [userRows] = await conn.query(
+      'SELECT password FROM admin_users WHERE id = ?',
+      [req.params.id]
+    );
+    
+    if (userRows.length === 0) {
+      conn.release();
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+    
+    const user = userRows[0];
+    // Verify current password using bcrypt (example)
+    // const isPasswordValid = await bcrypt.compare(current_password, user.password);
+    
+    // For now, using a simple comparison (replace with bcrypt in production)
+    if (current_password !== "valid_password_check") {
+      conn.release();
+      return res.status(401).json({
+        success: false,
+        message: "Current password is incorrect"
+      });
+    }
+    
+    // Hash new password (using bcrypt in production)
+    // const hashedPassword = await bcrypt.hash(new_password, 10);
+    const hashedPassword = new_password; // Replace with actual hash
+    
+    // Update password
+    await conn.query(
+      'UPDATE admin_users SET password = ? WHERE id = ?',
+      [hashedPassword, req.params.id]
+    );
+    
+    conn.release();
+    
+    res.json({
+      success: true,
+      message: 'Password updated successfully'
+    });
+    
+  } catch (error) {
+    console.error("Update password error:", error);
+    if (conn) conn.release();
+    res.status(500).json({
+      success: false,
+      message: 'Error updating password',
+      error: error.message
+    });
+  }
+});
+
+// Update 2FA status
+router.put('/admin-users/:id/2fa', async (req, res) => {
+  let conn;
+  try {
+    const { is_2fa_enabled } = req.body;
+    
+    if (is_2fa_enabled === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "2FA status is required"
+      });
+    }
+    
+    conn = await pool.getConnection();
+    
+    await conn.query(
+      'UPDATE admin_users SET is_2fa_enabled = ? WHERE id = ?',
+      [is_2fa_enabled ? 1 : 0, req.params.id]
+    );
+    
+    conn.release();
+    
+    res.json({
+      success: true,
+      message: `2FA ${is_2fa_enabled ? 'enabled' : 'disabled'} successfully`
+    });
+    
+  } catch (error) {
+    console.error("Update 2FA error:", error);
+    if (conn) conn.release();
+    res.status(500).json({
+      success: false,
+      message: 'Error updating 2FA settings',
+      error: error.message
+    });
+  }
+});
 module.exports = {
   router,
   authenticateToken
